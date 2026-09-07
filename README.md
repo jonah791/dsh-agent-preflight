@@ -1,5 +1,11 @@
 # dsh-agent-preflight
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-preflight"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 > 沙盒预检插件：重启/启动前强制验证组合可加载。
 > DeepSeek Harness 自研插件 · v0.1.1（从 dsh-agent-watch 拆分）
 
