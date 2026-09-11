@@ -338,6 +338,21 @@ function scanZstdFrames(buf: Buffer): Array<{ start: number; end: number }> {
   return frames
 }
 
+/**
+ * 保留文本头部（机制结论/错误原因）与尾部（原始日志），中间省略。
+ *
+ * 用于失败报告：试运行输出里「为什么失败」在开头、「现场日志」在结尾，
+ * 单边截断（旧行为 slice(-N)）必丢其一（2026-09-11 亲历诊断盲区）。
+ * @param text - 原始输出。
+ * @param headChars - 头部保留字符数。
+ * @param tailChars - 尾部保留字符数。
+ * @returns 裁剪后的文本（未超限时原样返回）。
+ */
+export function clipHeadTail(text: string, headChars: number, tailChars: number): string {
+  if (text.length <= headChars + tailChars) return text
+  return text.slice(0, headChars) + '\n…[中间省略 ' + String(text.length - headChars - tailChars) + ' 字符]…\n' + text.slice(-tailChars)
+}
+
 /** 找空闲端口（net 监听 0 取 OS 分配端口，然后关闭释放）。 */
 function findFreePort(): Promise<number> {
   return new Promise((resolvePromise) => {
@@ -506,7 +521,11 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   if (mode === 'full') {
     const tr = await trialRun(cfg)
     if (!tr.ok) {
-      fail('trialRun', '组合无法加载或 web 未响应：' + tr.output.slice(-300))
+      // 诊断盲区修复（2026-09-11 亲历）：原先 slice(-300) 只保留**尾部**日志，
+      // 而失败原因（'HTTP 探活超时…' / '组合无法加载（试运行退出 code=N）'）在输出**开头**
+      // ——被截掉后报告里只剩正常启动日志，无法归因（当日首次 FAIL 只能手动复现定位）。
+      // 改为「头 400 + 尾 700」：机制结论在前，原始日志在后。
+      fail('trialRun', '组合无法加载或 web 未响应：' + clipHeadTail(tr.output, 400, 700))
     } else {
       pass('trialRun', '组合试运行 + / HTTP 2xx/401/403（web 侧真实可用）')
     }
