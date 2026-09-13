@@ -48,6 +48,13 @@ export interface PreflightCoreConfig {
   /** HTTP 就绪后的存活确认窗口（ms）——2026-09-01 vision 事故防线。 */
   preflightGraceMs: number
   /**
+   * 试运行「仍在推进」窗口（ms，缺省 15000）：到期时若该窗口内仍有子进程输出，判为「仍在启动」→ 延长而非判死。
+   * 2026-09-13 事故：负载下试运行实例 83s 才输出第一行（90s 固定窗口被判死 = 假 FAIL，误拦主人重启）。
+   */
+  trialProgressWindowMs?: number
+  /** 试运行硬上限（ms，缺省 240000）：无论是否仍在推进都不再延长——fail-closed 兜底。 */
+  trialHardMaxMs?: number
+  /**
    * true=先探活现有实例（健康直接 PASS，毫秒级）——用于「当前组合」检查（preflight_check 工具/哨兵 gate）；
    * false=强制完整试运行——用于「组合变更后」检查（plugin_mount/setEnabled/remove/configure 后验证新组合，
    *   现有实例健康 ≠ 新组合可加载，必须真实 spawn 验证，失败回滚）。
@@ -394,6 +401,44 @@ export function probeHealth(port: number, timeoutMs: number): Promise<boolean> {
   })
 }
 
+/**
+ * 试运行截止裁决（纯函数，可离线单测）。
+ *
+ * 语义：**宁可延长可解释的慢启动，不可把「仍在启动」判成「组合不可加载」**；但延长必须有硬上限——
+ * fail-closed 的兜底不能被无限推进吃掉。
+ * 判据（依序）：① 触硬上限 → 判死；② 静默时长 < 推进窗口 → 延长；③ 否则判死（真静默 = 卡死，不是慢启动）。
+ *
+ * 2026-09-13 事故背景：90s 固定窗口在负载下必然偶发假 FAIL（实测该次试运行 02:37:42.297 → 02:39:12.319
+ * = 90.02s 用满，而子进程首行输出出现在 +83.1s，插件 apply 到 +87s 仍未 HTTP-ready）。
+ */
+export function decideTrialDeadline(input: {
+  startedAt: number
+  now: number
+  lastOutputAt: number
+  hardMaxMs: number
+  progressWindowMs: number
+}): { action: 'extend' | 'fail'; reason: string; elapsedMs: number; silentMs: number } {
+  const elapsedMs = input.now - input.startedAt
+  const silentMs = input.now - input.lastOutputAt
+  if (elapsedMs >= input.hardMaxMs) {
+    return { action: 'fail', reason: `触硬上限 ${input.hardMaxMs}ms`, elapsedMs, silentMs }
+  }
+  if (silentMs < input.progressWindowMs) {
+    return {
+      action: 'extend',
+      reason: `仍在推进（静默 ${silentMs}ms < ${input.progressWindowMs}ms）`,
+      elapsedMs,
+      silentMs,
+    }
+  }
+  return {
+    action: 'fail',
+    reason: `静默 ${silentMs}ms ≥ ${input.progressWindowMs}ms（无新输出 = 卡死，非慢启动）`,
+    elapsedMs,
+    silentMs,
+  }
+}
+
 /** 完整试运行：spawn 组合 + HTTP 探活 + 存活确认窗口（含 2026-09-01 spawn error 监听修复）。 */
 function runTrialSpawn(cfg: PreflightCoreConfig, resolvePromise: (r: { ok: boolean; output: string }) => void): void {
   if (!cfg.bin) { resolvePromise({ ok: false, output: '[预检] 无法定位 dsh bin.js' }); return }
@@ -408,28 +453,65 @@ function runTrialSpawn(cfg: PreflightCoreConfig, resolvePromise: (r: { ok: boole
   findFreePort().then((port) => {
     if (port === 0) { settle(false, '[预检] 无法分配空闲端口'); return }
     const args = ['--expose-internals', cfg.bin, '--profile', cfg.profile, '--port', String(port), '--no-open']
-    const child = spawn(process.execPath, args, { cwd: cfg.workspace })
+    const child = spawn(process.execPath, args, {
+      cwd: cfg.workspace,
+      // 试运行实例是**完整 web**（同 profile/凭据/DSH_HOME）：打标记让副作用型插件让位，
+      // 否则它会与 live 实例争抢外部资源（2026-09-13 实测：同一 Telegram bot 长轮询 409 冲突，
+      // 且第二个实例的 getUpdates 可能吞掉主人的消息）。
+      env: { ...process.env, DSH_PREFLIGHT_TRIAL: '1' },
+    })
     let spawnError: string | undefined
     child.on('error', (err) => { spawnError = String(err) })
+    const startedAt = Date.now()
+    let lastOutputAt = startedAt
+    let firstOutputAt = 0
     let out = ''
-    child.stdout?.on('data', (d: Buffer) => { out += d })
-    child.stderr?.on('data', (d: Buffer) => { out += d })
-    const hardTimer = setTimeout(() => {
-      child.kill()
-      settle(false, 'HTTP 探活超时（' + cfg.preflightReadyMs + 'ms 内 / 未返回可用 HTTP 状态 2xx/401/403）'
-        + '\n[spawn] ' + process.execPath + ' ' + args.join(' ')
-        + (spawnError === undefined ? '' : '\n[spawn error] ' + spawnError)
-        + '\n' + out.slice(-800))
-    }, cfg.preflightReadyMs)
+    const onOutput = (d: Buffer): void => {
+      out += d
+      lastOutputAt = Date.now()
+      if (firstOutputAt === 0) firstOutputAt = lastOutputAt
+    }
+    child.stdout?.on('data', onOutput)
+    child.stderr?.on('data', onOutput)
+
+    const progressWindowMs = Number(cfg.trialProgressWindowMs ?? 15000)
+    const hardMaxMs = Number(cfg.trialHardMaxMs ?? 240000)
+    let deadline: ReturnType<typeof setTimeout>
+    const arm = (delayMs: number): void => {
+      deadline = setTimeout(() => {
+        const verdict = decideTrialDeadline({
+          startedAt,
+          now: Date.now(),
+          lastOutputAt,
+          hardMaxMs,
+          progressWindowMs,
+        })
+        if (verdict.action === 'extend') {
+          log(`[预检] 试运行${verdict.reason} 已 +${verdict.elapsedMs}ms → 再等 ${progressWindowMs}ms（慢启动，不判死）`)
+          arm(progressWindowMs)
+          return
+        }
+        child.kill()
+        settle(false, 'HTTP 探活超时（' + verdict.reason + '）'
+          + '\n[预检] 试运行 +0ms 起，首次输出 ' + (firstOutputAt === 0 ? '（全程无输出）' : '+' + String(firstOutputAt - startedAt) + 'ms')
+          + '，判死于 +' + String(verdict.elapsedMs) + 'ms'
+          + '（基础窗口 ' + String(cfg.preflightReadyMs) + 'ms + 推进延长，硬上限 ' + String(hardMaxMs) + 'ms）'
+          + '\n[spawn] ' + process.execPath + ' ' + args.join(' ')
+          + (spawnError === undefined ? '' : '\n[spawn error] ' + spawnError)
+          + '\n' + out.slice(-800))
+      }, delayMs)
+    }
+    arm(cfg.preflightReadyMs)
+
     child.on('exit', (code) => {
-      clearTimeout(hardTimer)
+      clearTimeout(deadline)
       settle(false, '组合无法加载（试运行退出 code=' + code + '）\n' + out.slice(-1500))
     })
-    void probeHealth(port, cfg.preflightReadyMs).then((ok) => {
-      if (!ok) return // 由 hardTimer 收尾
+    void probeHealth(port, cfg.preflightReadyMs + hardMaxMs).then((ok) => {
+      if (!ok) return // 由 deadline 收尾
       const grace = Number(cfg.preflightGraceMs || 10000)
       setTimeout(() => {
-        clearTimeout(hardTimer)
+        clearTimeout(deadline)
         child.kill()
         settle(true, out)
       }, grace)

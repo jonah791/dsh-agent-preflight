@@ -56,6 +56,13 @@ export interface Config {
    * 组合变更场景（plugin-manager 挂载/启停/配置后）应传 false 强制完整试运行。
    */
   probeExistingFirst: boolean
+  /**
+   * 试运行「仍在推进」窗口（ms）：到期时该窗口内仍有子进程输出 → 判为慢启动并延长，而非判死。
+   * 2026-09-13 假 FAIL 事故：负载下试运行 90s 用满而首行输出在 +83.1s（仍在启动）→ 被判「组合不可加载」。
+   */
+  trialProgressWindowMs: number
+  /** 试运行硬上限（ms）：无论是否在推进都不再延长——fail-closed 兜底。 */
+  trialHardMaxMs: number
 }
 
 export const Config = z.object({
@@ -64,6 +71,10 @@ export const Config = z.object({
   profile: z.string().default('web'),
   preflightReadyMs: z.number().default(20000),
   preflightGraceMs: z.number().default(10000),
+  /** 试运行「仍在推进」窗口（ms）：到期时该窗口内仍有输出 → 延长而非判死（2026-09-13 假 FAIL 事故修复）。 */
+  trialProgressWindowMs: z.number().default(15000),
+  /** 试运行硬上限（ms）：无论是否在推进都不再延长——fail-closed 兜底。 */
+  trialHardMaxMs: z.number().default(240000),
   defaultWorkspace: z.string().default(''),
   targetPort: z.number().default(3080),
   probeExistingFirst: z.boolean().default(true),
@@ -92,6 +103,8 @@ export function apply(ctx: Context, config: Config): void {
     targetPort: Number(config.targetPort) || 3080,
     preflightReadyMs: config.preflightReadyMs,
     preflightGraceMs: config.preflightGraceMs,
+    trialProgressWindowMs: config.trialProgressWindowMs,
+    trialHardMaxMs: config.trialHardMaxMs,
     probeExistingFirst: config.probeExistingFirst,
     log: (msg) => logger.info(msg),
   })
