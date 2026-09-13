@@ -177,7 +177,22 @@ interface PreflightResult {
 | `rec.pass !== true` | 拒绝 | 「本进程最近一次预检未通过」 |
 | 以上皆过 | 放行 | evidence 行注明「预检记录来自 <调用者描述>」 |
 
-**sentinel 的变体**（`readPreflightInvokedGate`，第二道闸门，防手写哨兵绕过）：存在 → `pass===true` → `workspace` 一致 → `Date.now() - atMs <= 30 分钟`。**注意它用的是「30 分钟内」而非 `webStartMs`**——两个判据对同一事实可能给出不同答案（见 §10 U2）。
+**sentinel 的变体**（`readPreflightInvokedGate`，第二道闸门，防手写哨兵绕过）——**2026-09-13 起与 plugin-manager 同判据**（`t-49913844`；纯逻辑在 `sentinel/src/preflight-gate.ts`）：
+
+| 条件 | 裁决 | 文案 |
+|-----|------|------|
+| 记录读盘/解析失败 | 拒绝 | 「预检记录不可读（…）」——**不**伪装成「没调用过」 |
+| 记录缺失 | 拒绝 | 「本 web 进程内未调用过预检工具（preflight_check）」 |
+| `atMs` 非数字 | 拒绝 | 「预检记录无效（缺 atMs 或非数字）」 |
+| `rec.workspace !== workspace` | 拒绝 | 「预检记录 workspace 不匹配」 |
+| `atMs < 最新构建 mtime` | 拒绝 | 「组合已变更：最新构建晚于预检——该预检未验证当前组合」 |
+| `atMs < 本轮 web 启动时刻`（有记录时） | 拒绝 | 「预检记录早于本轮 web 启动」 |
+| `rec.pass !== true` | 拒绝 | 「本进程最近一次预检未通过」 |
+| 以上皆过 | 放行 | evidence 行含三个时间源（最新构建 / web 启动 / 预检记录） |
+
+判据语义 = **组合变更新鲜度**（fail-closed）：`pass===true && workspace 匹配 && atMs >= max(最新构建 mtime, 本轮 web 启动时刻)`；边界与 plugin-manager 一致（与门槛同毫秒 ⇒ 放行）。
+- 时间源缺失时**更严不更松**：无 web 启动记录（web 由 guardian/init 拉起）⇒ 退化为只比构建 mtime；哨兵自记的记录若早于本哨兵进程启动（哨兵重启过）⇒ **不采信**（§5.16 §2 锚点新鲜度）。
+- 与 plugin-manager 的差异只在 `webStartMs` 的**获取方式**：plugin-manager 在 web 进程内可用 `process.uptime()` 直接反推；sentinel 是独立进程，只能在**自己 spawn web 时**自记（`.sentinel-web-start.json`）。
 
 `callerComparison(rec, current)`：仅产出证据措辞（同一会话 / 不同会话 / 记录无调用者 / 本次未知）——**不参与裁决**。
 
@@ -190,7 +205,7 @@ interface PreflightResult {
 | 同上 | `src/index.ts` → `daemon_restart` 工具 `execute` | 重启前 | `preflightInvokedInProcess()` → 读记录 → `decidePreflightGate`；拒绝 ⇒ **不写哨兵**；无论放行与否写「门控证据」行到 `.plugin-manager-events.log` |
 | 同上（组合变更路径） | `src/profile.ts` → `import { runPreflightCore } from 'dsh-agent-preflight/core'` | `plugin_mount` / `setEnabled` / `remove` / `configure` 之后 | 验证**新组合**可加载；失败则回滚，不生效 |
 | `dsh-agent-sentinel` | `src/index.ts` → `runCycle`（`ctx.preflight.run(workspace,'full')`） | 每次检测到 `.hot-reload-flag` | FAIL ⇒ `writeIncident` + 通知 + **`return`（哨兵保留、不 kill）**；PASS ⇒ 按哨兵来源分派（`daemon_restart:` 前缀 = 已确认 → 走下一道闸门；其他来源 → 先送预检报告等我确认） |
-| `dsh-agent-sentinel` | `src/index.ts` → `readPreflightInvokedGate`（读 `.preflight-invoked.json`） | `daemon_restart` 来源的哨兵，重启前兜底 | 不满足即拦下并保留哨兵（防手写哨兵绕过 `daemon_restart` 工具） |
+| `dsh-agent-sentinel` | `src/index.ts` → `readPreflightInvokedGate`（读 `.preflight-invoked.json` + 扫构建 mtime + 读 `.sentinel-web-start.json`）→ `preflight-gate.ts:decideSentinelGate`（纯逻辑） | `daemon_restart` 来源的哨兵，重启前兜底 | 不满足即拦下并保留哨兵（防手写哨兵绕过 `daemon_restart` 工具）；裁决理由 + 三个时间源写 `.watch-events.log`。**2026-09-13 前用「30 分钟滑动窗口」**（见 §9） |
 | `dsh-agent-guardian` | `src/index.ts` → `spawnWeb`（统一拉起入口） | **所有**拉起路径（保活 / 崩溃自愈 / 启动自检） | `ctx.preflight.run(workspace,'quick')`；FAIL ⇒ `writeIncident('preflight gate failed; web NOT started')` + **不拉起** |
 | `dsh-agent-guardian` | 同上，storages 恢复分支 | 拉起前 | **顺序约束**：先恢复损坏存档 → 再 preflight（数据损坏会让试运行 fail-closed，顺序反了就永远起不来） |
 | 记录文件读者 | `plugin-manager` `readPreflightRecord`；`sentinel` `readPreflightInvokedGate` | 门控裁决时 | 读失败必须显式 issue/拒绝，**不得**伪装成「没调用过」 |
@@ -228,8 +243,10 @@ interface PreflightResult {
 | A9 | quick 模式不做试运行（时延显著低于 full） | 线上记录可证 `mode` 字段被写入（实测值 `"quick"`），但**尚无同一口径的耗时对照** | 待线上验收 |
 | A10 | 组合变更时短路失效（`hasUnverifiedBuilds` ⇒ 强制完整试运行） | 逻辑位于 `plugin-manager/src/index.ts:62/567`；**无单测、未在受控条件下实测** | 待线上验收 |
 | A11 | 会话日志完整性检查能拦未知事件类型 `agent-teams/*` | 该检查是 2026-08-26 事故的防线；当前**无测试夹具**、线上也未再触发 | 待线上验收 |
+| A12 | 哨兵侧闸门判据 = **组合变更新鲜度**（旧 30 分钟窗口会放行的形状必须被拒） | `dsh-agent-sentinel/tests/preflight-gate.test.mjs`：**23/23** 通过，含 2 条**回归尸体样本**（① 预检发生在上一 web 进程 + 其后有新构建 → 必须拒绝，旧实现会放行；② 预检晚于构建但早于本轮 web 启动 → 拒绝）+ 边界（同毫秒放行）+ 异常四类（缺失/损坏/非数字/workspace 不符/未通过）；哨兵全仓 **56/56** 零回归 | ✔ 已实测（离线） |
+| A13 | 哨兵侧新判据**线上生效**（`.watch-events.log` 出现 `预检闸门裁决:` 行且含三个时间源） | 代码/测试/构建完成于 2026-09-13，但 watch profile 重启归主人（§5.2）——部署窗口前线上仍跑旧判据（§5.11 §6 重建≠生效） | 待线上验收 |
 
-> 计数：total 11 · 已实测 7（A1–A7）· 待线上验收 4（A8–A11）。
+> 计数：total 13 · 已实测 8（A1–A7、A12）· 待线上验收 5（A8–A11、A13）。
 > 说明：本表状态词遵循机器约定（`✔/✅/已实测` = 有证据；`待线上验收` = 未验证）。
 
 ---
@@ -241,7 +258,7 @@ interface PreflightResult {
 - **同语义副本（消费方，互相指认）**：
   - `plugin-manager/src/preflight-gate.ts` —— **闸门裁决**的纯逻辑（数据结构、裁决表、调用者提取）；其文件头明确指认本能力为判据来源（§5.5）。
   - `plugin-manager/src/profile.ts` —— 组合变更路径直调 `dsh-agent-preflight/core`（与 watch 内服务**同源**，D1 唯一化于 2026-09-03 完成）。
-  - `sentinel/src/index.ts` 的 `readPreflightInvokedGate` —— 本能力的**第二道闸门变体**（30 分钟窗口），语义略有偏离（见 §10 U2、§9 残留文案）。
+  - `sentinel/src/preflight-gate.ts` —— 本能力**第二道闸门**的纯逻辑（2026-09-13 起与 `plugin-manager/src/preflight-gate.ts` **同判据**：组合变更新鲜度；差异只在 `webStartMs` 的获取方式——独立进程只能自记）；IO 接线在 `sentinel/src/index.ts`。
 - **未实现 / 未验证部分（显式标注）**：
   - **无 `/health` 路由**：2026-08-31 主人定调「不改原版 DSH」，探活改用 `GET /`（见 §9）。
   - 本插件**自身**只有 `tests/clip.test.mjs`（4 条）；8 个检查器与试运行**没有离线单测**，其证据来自线上事件日志与消费方测试。
@@ -280,14 +297,18 @@ interface PreflightResult {
   - 语义**被确认**：判据保持进程级（**不改设计**）。
   - 语义**被修正**：① 文案一律如实说「本 **web 进程**」；② 记录**真实调用者** `caller`（取自 `exec.agent`，duck-typing、缺失降级为未知不抛）；③ 每次 `daemon_restart` 裁决写**证据行**（谁按的按钮 + 本次与记录的调用者比对结论）——让「为什么我的重启能过闸」可回答。`sessionId` 字段被明确标注为**历史遗留**（= 活跃/主会话，不是调用者）。
   - 教训（回写技能 `semantic-doc-first`）：**判据的作用域必须与文案同名**；记录主体时用**权威来源**（`exec.agent`）而非**就近可得的代理量**（「当前活跃会话」看起来最像答案，恰恰是错的）。
-  - **残留（未修，见 §10 U1）**：`sentinel` 侧仍有「本会话未调用过预检工具」「预检记录已过期（>30 分钟，非本会话）」的旧文案。
+  - **残留已清（2026-09-13 `t-49913844`）**：`sentinel` 侧旧文案「本会话未调用过预检工具」「预检记录已过期（>30 分钟，非本会话）」与 30 分钟窗口判据已随判据对齐一并移除（见下方 09-13 条目）。
+- **2026-09-13 哨兵侧判据对齐 + 文案去漂移（`t-49913844`；来源：写本文时逼出的 U1/U2）**
+  - 事故形状（**未发生但可构造**）：预检发生在**上一个** web 进程内（≤30 分钟前），其后代码又被构建过 → 哨兵旧判据（30 分钟窗口）**放行** → kill web 部署一个**从未被预检验证过的新组合**——正是 AGENTS.md §5.11 §1 禁止的「拿旧实例健康当免检」；而 plugin-manager 侧（进程级判据）对同一事实会**拒绝** ⇒ 一方拒绝、一方放行。
+  - 语义**被修正**：① 判据统一为**组合变更新鲜度** `atMs >= max(最新构建 mtime, 本轮 web 启动时刻)`；② 文案一律「本 **web 进程**」；③ 裁决理由 + 三个时间源落 `.watch-events.log`（事后可回答「为什么这次放行/拒绝」）；④ 判据抽成纯函数（`decideSentinelGate` / `resolveWebStartMs` / `pickLatestBuildMs`）+ 23 条离线单测（含**回归尸体样本**：旧 30 分钟窗口会放行的形状必须被拒）。
+  - 语义**被确认**：哨兵是独立进程，`webStartMs` 只能自记（`.sentinel-web-start.json`，spawn web 时写）；记录早于本哨兵进程启动即**不采信**，退化为只比构建 mtime（**更严不更松**）；扫不到任何构建产物时留证告警（不静默）。
+  - 教训：**同一事实的两套判据 = 两个真相**。凡「两处判定同一件事」，必须给出判据对齐表（谁用哪个时间源、缺失时如何退化），否则一致性只是巧合。
 
 ---
 
 ## 10 · 未决问题
 
-- **U1 sentinel 侧文案残留**：`readPreflightInvokedGate` 的错误文案仍说「本会话 / 非本会话」，与进程级+30 分钟判据不符。倾向：改为「本 web 进程（30 分钟内）」并补一条 `atMs >= webStartMs` 比对；需一次 watch profile 部署窗口（守护类改动受 §5.2 约束）。
-- **U2 两套判据并存**：`plugin-manager` 用 `atMs >= webStartMs`（严格「本进程内」），`sentinel` 用「30 分钟内」（可能跨进程残留）。同一事实两种答案 ⇒ 存在「plugin-manager 拒绝、sentinel 放行」的窗口。倾向：统一为「进程级 + 兜底 30 分钟」并把两者关系写进 §5.5；需主人裁决是否收紧哨兵侧。
+- **U1 哨兵侧新判据待上线（2026-09-13 `t-49913844`：代码/测试/构建已完成，等 watch 部署窗口）**：旧 U1（文案残留）与旧 U2（哨兵 30 分钟窗口与 plugin-manager 进程级判据并存）已从**代码层**解决（见 §5.5 判据表、§9 修订记录），但**线上哨兵仍跑旧判据**——改动受 §5.2 约束（watch profile 重启归主人），部署窗口到来前 §5.11 §6「重建 ≠ 生效」适用。上线验收：`.watch-events.log` 出现 `预检闸门裁决:` 行，且含「最新构建 / 本轮web启动 / 预检记录」三个时间源。
 - **U3 会话日志检查无测试**：`sessionLogCheck` 是 2026-08-26 事故的防线，却没有任何夹具（未知事件样本）。倾向：用真实损坏样本做尸体测试（构造含 `"type":"agent-teams/` 的最小 zstd 多帧文件）。
 - **U4 `probeExistingFirst` 短路边界**：判定依据是 `lib/index.js` mtime；若新构建的 mtime 早于本进程启动（例如构建后回滚文件时间），短路会误判「已验证」。倾向：改判据为「launch 后是否有新构建**出现过**」（落盘标记），而非纯 mtime 比较。
 - **U5 检查项与 harness 启动检查的对齐维护**：本能力自称「对齐 `dsh-app-boot` 的 assertEntriesLoaded/Activated」，但 harness 升级后对齐关系无机器校验。倾向：把 harness 侧的启动检查清单固化成一份对照表并纳入 D3 类 drift（文档 vs 实现）。
