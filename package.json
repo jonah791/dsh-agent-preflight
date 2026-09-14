@@ -1,37 +1,38 @@
 {
-    "name":  "dsh-agent-preflight",
-    "version": "0.1.2",
-    "description":  "沙盒预检插件（从 dsh-agent-watch 拆分）：重启/启动前强制预检服务——插件静态健康（lib/src 时效/schema DSL）、磁盘、profile manifest 校验、patch 文件校验、peer 依赖、环境变量、会话日志完整性、试运行组合加载（对齐 harness 启动检查 assertEntriesLoaded/Activated）。提供 preflight(workspace, mode) 服务供哨兵/守卫消费。",
-    "type":  "module",
-    "main":  "lib/index.js",
-    "types":  "lib/types/index.d.ts",
-    "exports":  {
-                    ".":  {
-                              "types":  "./lib/types/index.d.ts",
-                              "default":  "./lib/index.js"
-                          },
-                    "./core":  {
-                                   "types":  "./lib/types/core.d.ts",
-                                   "default":  "./lib/core.js"
-                               },
-                    "./package.json":  "./package.json"
-                },
-    "files":  [
-                  "lib",
-                  "README.md"
-              ],
-    "license":  "MIT",
-    "peerDependencies":  {
-                             "@deepseek-ai/cordis":  "^4.0.1",
-                             "@deepseek-ai/schemastery":  "^3.18.1-rc.1",
-                             "@deepseek-ai/dsh-tools":  "^0.1.0-rc.6"
-                         },
-    "devDependencies":  {
-                            "@types/node":  "^22.0.0",
-                            "typescript":  "^5.9.3"
-                        },
-    "scripts":  {
-                    "build":  "tsc -p tsconfig.json",
-                    "typecheck":  "tsc -p tsconfig.json --noEmit"
-                }
+  "name": "dsh-agent-preflight",
+  "version": "0.1.2",
+  "description": "沙盒预检插件（从 dsh-agent-watch 拆分）：重启/启动前强制预检服务——插件静态健康（lib/src 时效/schema DSL）、磁盘、profile manifest 校验、patch 文件校验、peer 依赖、环境变量、会话日志完整性、试运行组合加载（对齐 harness 启动检查 assertEntriesLoaded/Activated）。提供 preflight(workspace, mode) 服务供哨兵/守卫消费。",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./core": {
+      "types": "./lib/types/core.d.ts",
+      "default": "./lib/core.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.1-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"tests/*.test.mjs\""
+  }
 }
