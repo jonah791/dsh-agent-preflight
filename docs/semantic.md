@@ -2,7 +2,7 @@
 
 > 版本 v0.1 · 2026-09-13 · 作者：爱丽丝 · 状态：已实现（线上运行中：watch profile 提供服务，web 侧同源直调）
 > 开发方式：语义文档优先（先写清「是什么 / 什么关系 / 怎么裁决」，再让实现逼近，最后用实践回修）
-> 实现落点：`self-plugins/dsh-agent-preflight/src/core.ts`（检查核心）· `src/index.ts`（服务壳）；消费方闸门副本 `self-plugins/dsh-agent-plugin-manager/src/preflight-gate.ts`
+> 实现落点：`self-plugins/dsh-agent-preflight/src/core.ts`（检查核心）· `src/index.ts`（服务壳）· `src/trace.ts`（自证轨迹 · 2026-09-14）；消费方闸门副本 `self-plugins/dsh-agent-plugin-manager/src/preflight-gate.ts`
 
 ## 1 · 元信息
 
@@ -11,8 +11,8 @@
 | 能力名 | 预检门控（preflight-gate） |
 | 主副本 | 本文件（`self-plugins/dsh-agent-preflight/docs/semantic.md`） |
 | 版本 / 日期 | v0.1 · 2026-09-13 · 作者：爱丽丝 |
-| 状态 | 已实现（线上运行中：watch profile 提供 `ctx.preflight` 服务；web profile 的 plugin-manager 直调同一份核心）｜验收 11 条：**7 已实测 / 4 待线上验收** |
-| 实现落点 | `self-plugins/dsh-agent-preflight/src/core.ts`（检查核心，D1 唯一化）· `src/index.ts`（服务壳） |
+| 状态 | 已实现（线上运行中：watch profile 提供 `ctx.preflight` 服务；web profile 的 plugin-manager 直调同一份核心）｜验收 15 条：**10 已实测 / 5 待线上验收** |
+| 实现落点 | `self-plugins/dsh-agent-preflight/src/core.ts`（检查核心，D1 唯一化）· `src/index.ts`（服务壳）· `src/trace.ts`（自证轨迹：纯函数 + 薄 IO） |
 | 消费方语义副本 | `self-plugins/dsh-agent-plugin-manager/src/preflight-gate.ts`（闸门纯逻辑，**判据来源指向本文件**） |
 | 挂载 | `profiles/watch/cordis.patch.yml:31`（`dsh-agent-preflight` 行） |
 | 相关 | AGENTS.md §5.11 §3（进程级判据）、§6.2（插件热重载协议）、§5.19（生命周期租约）；任务 `t-a2385a9f`；插件版本 v0.1.1 |
@@ -28,7 +28,7 @@
 **反定位（本能力不做的事）**：
 
 - **不负责监听哨兵、不负责 kill/拉起**——那是 `dsh-agent-sentinel`（重启）与 `dsh-agent-guardian`（保活拉起）。本能力只回答「能不能动」，不执行「动」。
-- **不负责记录谁调用了预检**——写入 `.preflight-invoked.json` 的是 `dsh-agent-plugin-manager`（`preflight_check` 工具）；本能力只提供**被调用的检查本体**。
+- **不负责记录「谁调用了预检」**——写入 `.preflight-invoked.json` 的是 `dsh-agent-plugin-manager`（`preflight_check` 工具）；本能力只提供**被调用的检查本体**。注意区分：本能力**自己**会为每次运行落一行自证轨迹（`preflight-trace.jsonl`，§5.7）——那是**运行证据**，不是**门控记录**（门控仍以 `.preflight-invoked.json` 为唯一真源）。
 - **不是会话级授权机制**——门控判据是**进程级**（「本 web 进程内调用过」），**不比对会话 id**（见 §4 I2 与 §9）。
 - **不是沙箱、不是安全边界**——它防的是「组合装载失败」这类工程损坏，不防恶意代码、不防越权操作（能力 ≠ 沙箱）。
 - **不是组合语义校验器**——只验证「能否加载」，不判断「这套组合是不是我想要的」。
@@ -50,6 +50,8 @@
 | 进程级判据 | 「本 web 进程启动后调用过」= `atMs >= webStartMs`（`webStartMs = Date.now() - process.uptime()*1000`） |
 | 组合变更 | 改代码/构建/挂载/启停/改配置后重启——**旧实例健康 ≠ 新组合可加载** |
 | 调用者 / caller | 触发 `preflight_check` 的 agent（取自 `exec.agent`）；**只作证据，不作门控** |
+| 自证轨迹 / preflight-trace | `<DSH_HOME>/preflight-trace.jsonl`：本能力**每次运行**自己落的阶段行（`start`→`trialRun/begin`→`trialRun/end`→`verdict`）——回答「线上跑哪个构建 / 谁发起 / 断在哪一段 / 结果 / 耗时」（§5.7） |
+| 断点分类 / classifyTrialFailure | 把试运行的自由文本失败归到可 grep 的类别：`no-bin` / `no-port` / `child-exit` / `timeout` / `empty-output` / `unknown` |
 
 ---
 
@@ -210,6 +212,36 @@ interface PreflightResult {
 | `dsh-agent-guardian` | 同上，storages 恢复分支 | 拉起前 | **顺序约束**：先恢复损坏存档 → 再 preflight（数据损坏会让试运行 fail-closed，顺序反了就永远起不来） |
 | 记录文件读者 | `plugin-manager` `readPreflightRecord`；`sentinel` `readPreflightInvokedGate` | 门控裁决时 | 读失败必须显式 issue/拒绝，**不得**伪装成「没调用过」 |
 
+### 5.7 自证轨迹 `preflight-trace.jsonl` `[MUST]`（2026-09-14 S4 证据层）
+
+**动机**：本能力是组合试运行的**计算引擎**，自己什么都不落盘——「已调用预检」由消费方写进 `.preflight-invoked.json`。于是**试运行失败时没有任何自证产物**：失败细节只活在调用方返回值与 `ctx.logger` 里，而**宿主 logger 不落盘**（AGENTS.md §5.22 规则 1）⇒ 排障只能现场写脚本反解源码。
+
+| 项 | 契约 |
+|---|---|
+| 落盘路径 | `<DSH_HOME>/preflight-trace.jsonl`（`DSH_HOME` 解析**单一真源** `trace.ts:resolveHome`：环境变量 → 回退 `<homedir>/.dsh`） |
+| 行格式 | 单行 JSONL，一行一阶段，键序固定（`tail`/`grep`/与会话事件流 join） |
+| 阶段枚举 | `start`（进入 `runPreflightCore`）→ `trialRun/begin` → `trialRun/end` → `verdict`（收口）。**quick 模式只有 `start`/`verdict`**；静态项快速失败时同样不出现 `trialRun/*`（**断点即最后一条非 verdict 阶段**） |
+| 行 schema | `{atMs, phase, mode, build, pid, builds[], durationMs, verdict?, failedChecks[]?, shortcut?, error?, caller?}` |
+| `build` | `Q1` 本插件构建标识 `<version>@<core 模块 mtime ms>`（版本号会说谎，mtime 不会） |
+| `builds[]` | `Q1` 参与本次预检的构建清单 `{name, version, mtimeMs}`：自建 + 试运行目标 `dsh-bin`（不可得则省略，不写 `mtimeMs=0` 的假构建） |
+| `caller` / `pid` | `Q2` 调用栈**首个非本插件帧**（`文件:行`）+ 进程 pid——预检在 watch 与 web 两侧都跑，pid 区分调用者进程 |
+| `error` | `Q3` 断点：`trialRun/end` 失败写 `classifyTrialFailure(输出)` 分类 + 首行结论；`verdict=FAIL` 写首个失败检查的 detail（截 300 字符） |
+| `durationMs` | `Q5` 阶段耗时：`start=0`；`trialRun/*` = 试运行实耗（对照 `preflightReadyMs` + 推进窗口 + `trialHardMaxMs` 预算）；`verdict` = 全程 |
+| `verdict` / `failedChecks` / `shortcut` | `Q4` 结果质量：`PASS/FAIL` + 失败检查项键 + 是否走了「现有实例健康短路」（区分**真试运行**与**毫秒级短路**） |
+
+**观测绝不反噬（技能 C4）**：`appendTraceEntry` / `preflightTrace` 一律 try/catch 吞错并返回 `bool`——路径不可写、目录缺失、序列化失败**都不得改变预检结论**，也不得抛。
+
+**调用点清单 `[MUST]`**：
+
+| 位置（文件:符号） | 写入阶段 | 说明 |
+|---|---|---|
+| `src/core.ts:runPreflightCore`（入口） | `start` | 取 `collectBuilds`（自建 + bin）与 `captureCaller(new Error().stack)`，每次运行**只算一次** |
+| 同上（`mode==='full'` 分支） | `trialRun/begin` → `trialRun/end` | `trialRun/end` 记录试运行实耗、`shortcut`、失败断点分类 |
+| 同上（`finish()` 收口，**三条 return 路径共用**：硬失败/无试运行/正常收尾） | `verdict` | 单一收口点——避免「某个 return 忘了写」的漏记（skill C3 窗口语义） |
+| `src/trace.ts` | — | 纯函数（路径/序列化/解析/分类/调用者提取/构建清单）+ 薄 IO（`appendTraceEntry`）；`src/core.ts` 只做接线 |
+
+**消费方**（同一份 core 被 plugin-manager 直调 ⇒ **两条调用路径都会落账**，`pid`/`caller` 可区分）：`dsh-agent-preflight` 服务壳、`dsh-agent-plugin-manager/src/profile.ts`。**不新增落盘副作用型依赖**：轨迹文件只追加，不参与任何裁决。
+
 ---
 
 ## 6 · 边界与信任
@@ -224,6 +256,7 @@ interface PreflightResult {
   | 试运行超时 | `hardTimer` kill 子进程 → FAIL，报告含 spawn 命令行与 `spawn error` |
   | 探活拿不到可接受状态码 | 重试至 `preflightReadyMs` 到期 → FAIL |
   | 检查器内部异常 | 单项 catch（`sessionLog`/`peerDeps` 等）→ 保守/忽略，**不误报 FAIL**（误报会 fail-closed 卡死正常部署） |
+  | **自证轨迹写失败** | `preflightTrace` 吞错返回 `false`——**预检结论不变、不抛**（观测绝不反噬）；有尸体测试锁住（§7 A15） |
 - **坏数据取向**：记录缺失/无效/过期/workspace 不符 → **一律拒绝**（fail-closed）；检查器自身异常 → 宁可漏报也不误报（因为误报的代价是「正常部署被永久拦住」）。
 
 ---
@@ -245,15 +278,18 @@ interface PreflightResult {
 | A11 | 会话日志完整性检查能拦未知事件类型 `agent-teams/*` | 该检查是 2026-08-26 事故的防线；当前**无测试夹具**、线上也未再触发 | 待线上验收 |
 | A12 | 哨兵侧闸门判据 = **组合变更新鲜度**（旧 30 分钟窗口会放行的形状必须被拒） | `dsh-agent-sentinel/tests/preflight-gate.test.mjs`：**23/23** 通过，含 2 条**回归尸体样本**（① 预检发生在上一 web 进程 + 其后有新构建 → 必须拒绝，旧实现会放行；② 预检晚于构建但早于本轮 web 启动 → 拒绝）+ 边界（同毫秒放行）+ 异常四类（缺失/损坏/非数字/workspace 不符/未通过）；哨兵全仓 **56/56** 零回归 | ✔ 已实测（离线） |
 | A13 | 哨兵侧新判据**线上生效**（`.watch-events.log` 出现 `预检闸门裁决:` 行且含三个时间源） | 代码/测试/构建完成于 2026-09-13，但 watch profile 重启归主人（§5.2）——部署窗口前线上仍跑旧判据（§5.11 §6 重建≠生效） | 待线上验收 |
+| A14 | 每次预检**自己落盘**阶段行：真实调用路径（不是只有纯函数）产出 `start → … → verdict`，quick 无 `trialRun/*`，full 有 `trialRun/begin`/`trialRun/end` | `tests/wiring.test.mjs` 2 条**接线证据**（搭临时组合喂 `DSH_HOME`，断言 `<DSH_HOME>/preflight-trace.jsonl` 阶段序列 + `build` 形状 + `caller` 命中测试文件帧 + `no-bin` 断点分类）：`npm test` **24/24** 通过 | ✔ 已实测（离线接线） |
+| A15 | 轨迹写失败**不反噬**：不可写路径 → 返回 `false` 且不抛，预检结论不变 | `tests/trace.test.mjs` 尸体测试（父路径是普通文件 → `false` 且 `doesNotThrow`）+ 坏行/半行/空行/`null` 容错解析 + 缺失文件返回 `[]`；`preflightTrace` 不可写路径返回 `false` | ✔ 已实测 |
 
-> 计数：total 13 · 已实测 8（A1–A7、A12）· 待线上验收 5（A8–A11、A13）。
+> 计数：total 15 · 已实测 10（A1–A7、A12、A14、A15）· 待线上验收 5（A8–A11、A13）。
 > 说明：本表状态词遵循机器约定（`✔/✅/已实测` = 有证据；`待线上验收` = 未验证）。
+> `tail -n 4 <DSH_HOME>/preflight-trace.jsonl` 是 A14 的**线上复核命令**（部署窗口后执行；当前该文件尚未生成）。
 
 ---
 
 ## 8 · 与实现的关系
 
-- **主实现**：`self-plugins/dsh-agent-preflight/src/core.ts`（`runPreflightCore` + 8 个检查器 + `probeHealth` / `runTrialSpawn` / `clipHeadTail`）。
+- **主实现**：`self-plugins/dsh-agent-preflight/src/core.ts`（`runPreflightCore` + 8 个检查器 + `probeHealth` / `runTrialSpawn` / `clipHeadTail`）+ `src/trace.ts`（自证轨迹：纯函数 + 薄 IO，`core.ts` 只做接线）。
 - **服务壳**：`src/index.ts`（读 Config → 组装 `PreflightCoreConfig` → `ctx.provide('preflight', { run })`）。
 - **同语义副本（消费方，互相指认）**：
   - `plugin-manager/src/preflight-gate.ts` —— **闸门裁决**的纯逻辑（数据结构、裁决表、调用者提取）；其文件头明确指认本能力为判据来源（§5.5）。
@@ -261,7 +297,7 @@ interface PreflightResult {
   - `sentinel/src/preflight-gate.ts` —— 本能力**第二道闸门**的纯逻辑（2026-09-13 起与 `plugin-manager/src/preflight-gate.ts` **同判据**：组合变更新鲜度；差异只在 `webStartMs` 的获取方式——独立进程只能自记）；IO 接线在 `sentinel/src/index.ts`。
 - **未实现 / 未验证部分（显式标注）**：
   - **无 `/health` 路由**：2026-08-31 主人定调「不改原版 DSH」，探活改用 `GET /`（见 §9）。
-  - 本插件**自身**只有 `tests/clip.test.mjs`（4 条）；8 个检查器与试运行**没有离线单测**，其证据来自线上事件日志与消费方测试。
+  - 本插件**自身**测试：`tests/clip.test.mjs`（4）、`tests/trial-deadline.test.mjs`（6）、`tests/trace.test.mjs`（12）、`tests/wiring.test.mjs`（2）= **24 条**；8 个检查器与完整试运行（spawn 真实子进程）**仍无离线单测**（试运行路径的接线由 `wiring.test.mjs` 覆盖到 `bin` 不可得分支，真 spawn 分支的证据仍来自线上事件日志与消费方测试）。
   - 未接入 CI；未做「探活时序」的单元级模拟（grace 窗口为时间相关的集成行为）。
 
 ---
@@ -303,6 +339,12 @@ interface PreflightResult {
   - 语义**被修正**：① 判据统一为**组合变更新鲜度** `atMs >= max(最新构建 mtime, 本轮 web 启动时刻)`；② 文案一律「本 **web 进程**」；③ 裁决理由 + 三个时间源落 `.watch-events.log`（事后可回答「为什么这次放行/拒绝」）；④ 判据抽成纯函数（`decideSentinelGate` / `resolveWebStartMs` / `pickLatestBuildMs`）+ 23 条离线单测（含**回归尸体样本**：旧 30 分钟窗口会放行的形状必须被拒）。
   - 语义**被确认**：哨兵是独立进程，`webStartMs` 只能自记（`.sentinel-web-start.json`，spawn web 时写）；记录早于本哨兵进程启动即**不采信**，退化为只比构建 mtime（**更严不更松**）；扫不到任何构建产物时留证告警（不静默）。
   - 教训：**同一事实的两套判据 = 两个真相**。凡「两处判定同一件事」，必须给出判据对齐表（谁用哪个时间源、缺失时如何退化），否则一致性只是巧合。
+- **2026-09-14 自证证据层（主人判「可维护性很差」→ 插件可维护性补课批次 W4；S4 判据）**
+  - 事故形状（**未发生但可构造**）：试运行 FAIL 时本插件**不落任何自证产物**——「哪次预检、哪个构建、走到哪一步、耗时多久、现有实例短路还是真 spawn」全部只存在于调用方返回值与 `ctx.logger`（**宿主 logger 不落盘**）。排障只能外部写脚本反解。
+  - 语义**被补充**：`src/trace.ts` + `<DSH_HOME>/preflight-trace.jsonl`（§5.7）——阶段枚举 `start` / `trialRun/begin` / `trialRun/end` / `verdict`；`build` 自证构建、`builds[]`（自建 + 试运行 bin）、`pid`/`caller`、`durationMs`、`verdict`/`failedChecks`/`shortcut`、断点分类 `error`。
+  - 语义**被补充**：`trialRun` 返回值新增 `shortcut: boolean`（短路 PASS vs 真 spawn）——否则「毫秒级 PASS」与「试运行通过」在证据层无法区分（**Q4 结果质量**）。
+  - 语义**被确认**：轨迹**只追加、不参与裁决**——`.preflight-invoked.json` 仍是门控唯一真源（§2 反定位已显式区分「运行证据」与「门控记录」）。
+  - 教训（回写技能 `plugin-maintainability`）：**计算引擎型插件同样要自证**——「标记由消费方写」不等于「本插件有证据层」；失败现场的产出方才是最该说话的那个。
 
 ---
 
@@ -313,3 +355,6 @@ interface PreflightResult {
 - **U4 `probeExistingFirst` 短路边界**：判定依据是 `lib/index.js` mtime；若新构建的 mtime 早于本进程启动（例如构建后回滚文件时间），短路会误判「已验证」。倾向：改判据为「launch 后是否有新构建**出现过**」（落盘标记），而非纯 mtime 比较。
 - **U5 检查项与 harness 启动检查的对齐维护**：本能力自称「对齐 `dsh-app-boot` 的 assertEntriesLoaded/Activated」，但 harness 升级后对齐关系无机器校验。倾向：把 harness 侧的启动检查清单固化成一份对照表并纳入 D3 类 drift（文档 vs 实现）。
 - **U6 是否给 web 加 `/health`**：2026-08-31 主人定调「不改原版」（方案 A 只做过侦察）。现状 `GET /` 口径可用（实测 401）；若将来 web 端有了稳定健康端点，应优先改用它并回写本文 §5.3 ⑥ 与 §9。
+- **U7 `preflight-trace.jsonl` 无裁剪上限**：与 `plugin-boot.jsonl` 不同，本轨迹**没有** `keepLines` 轮转——写频率低（每次预检 ≤4 行）但长期无界。倾向：等真实行数/体积可观测后再定阈值（先要证据，再加机制）；若加，应复用 bootreport 的「旁车 + rename 原子替换」写法。
+- **U8 `caller` 在转译/打包环境下降级为 `unknown`**：栈帧解析依赖 V8 的 `at <file>:<line>:<col>` 形状；若消费方以 bundle 形式加载，帧可能不含物理文件路径（已降级不抛）。倾向：与 plugin-manager 的 `exec.agent` 证据行**交叉 join**（那是权威来源），本字段只作辅助。
+- **U9 轨迹尚未接入体检器**：`scripts/plugin-maintainability-audit.py` 只判「有落盘证据层 + 路径可锚定」，不读轨迹内容。倾向：S4 若升级为「能回答五问」，需给体检器加一条 `--trace <plugin>` 读取模式（当前由 §5.7 的表 + `tail` 命令代替）。

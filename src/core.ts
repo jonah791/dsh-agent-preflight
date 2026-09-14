@@ -9,6 +9,9 @@
  * 唯一化目的：消除 plugin-manager profile.ts 里第二套简陋 spawn 预检（只等 readyMs 存活，
  * 无静态检查/无 HTTP 探活/无存活确认窗口——2026-09-01 vision 事故形态的漏检实现）。
  *
+ * 自证轨迹（2026-09-14 S4 证据层）：每次预检落 `<DSH_HOME>/preflight-trace.jsonl`
+ * （阶段 `start` → `trialRun/begin` → `trialRun/end` → `verdict`），纯逻辑与 IO 见 ./trace.ts。
+ *
  * @module dsh-agent-preflight/core
  */
 import { existsSync, readFileSync, readdirSync, statSync, statfsSync } from 'node:fs'
@@ -18,10 +21,23 @@ import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { createServer } from 'node:net'
 import { get as httpGet } from 'node:http'
+import {
+  buildStamp,
+  captureCaller,
+  classifyTrialFailure,
+  collectBuilds,
+  preflightTrace,
+  readPackageVersion,
+  type PreflightTraceEntry,
+} from './trace.ts'
 
 // require 基准：本文件物理位置（link 依赖/跨包 import 下依然正确）
 const HERE = dirname(fileURLToPath(import.meta.url))
 const requireNode = createRequire(join(HERE, 'package.json'))
+
+// 构建自证（Q1）：<version>@<core 模块 mtime ms>——版本号会说谎，mtime 不会。
+const OWN_FILE = fileURLToPath(import.meta.url)
+const OWN_BUILD = buildStamp(OWN_FILE, readPackageVersion(OWN_FILE))
 
 /** 预检结果。 */
 export interface PreflightResult {
@@ -440,15 +456,18 @@ export function decideTrialDeadline(input: {
 }
 
 /** 完整试运行：spawn 组合 + HTTP 探活 + 存活确认窗口（含 2026-09-01 spawn error 监听修复）。 */
-function runTrialSpawn(cfg: PreflightCoreConfig, resolvePromise: (r: { ok: boolean; output: string }) => void): void {
-  if (!cfg.bin) { resolvePromise({ ok: false, output: '[预检] 无法定位 dsh bin.js' }); return }
+function runTrialSpawn(
+  cfg: PreflightCoreConfig,
+  resolvePromise: (r: { ok: boolean; output: string; shortcut: boolean }) => void,
+): void {
+  if (!cfg.bin) { resolvePromise({ ok: false, output: '[预检] 无法定位 dsh bin.js', shortcut: false }); return }
   const log = cfg.log ?? noopLog
   log('[预检] 试运行 profile "' + cfg.profile + '" @ ' + cfg.workspace + ' ...')
   let settled = false
   const settle = (ok: boolean, output: string): void => {
     if (settled) return
     settled = true
-    resolvePromise({ ok, output })
+    resolvePromise({ ok, output, shortcut: false })
   }
   findFreePort().then((port) => {
     if (port === 0) { settle(false, '[预检] 无法分配空闲端口'); return }
@@ -520,9 +539,9 @@ function runTrialSpawn(cfg: PreflightCoreConfig, resolvePromise: (r: { ok: boole
 }
 
 /** ⑥ 试运行组合加载 + web 侧 HTTP 探活。probeExistingFirst=true 时先探活现有实例短路（毫秒级 PASS）。 */
-function trialRun(cfg: PreflightCoreConfig): Promise<{ ok: boolean; output: string }> {
+function trialRun(cfg: PreflightCoreConfig): Promise<{ ok: boolean; output: string; shortcut: boolean }> {
   return new Promise((resolvePromise) => {
-    if (!cfg.bin) { resolvePromise({ ok: false, output: '[预检] 无法定位 dsh bin.js' }); return }
+    if (!cfg.bin) { resolvePromise({ ok: false, output: '[预检] 无法定位 dsh bin.js', shortcut: false }); return }
     const log = cfg.log ?? noopLog
     if (cfg.probeExistingFirst) {
       const targetPort = Number(cfg.targetPort) || 3080
@@ -530,7 +549,7 @@ function trialRun(cfg: PreflightCoreConfig): Promise<{ ok: boolean; output: stri
       probeHealth(targetPort, 3000).then((alive) => {
         if (alive) {
           log(`[预检] 现有实例 @ :${targetPort} 健康 → 直接 PASS（跳过试运行）`)
-          resolvePromise({ ok: true, output: `现有实例 @ :${targetPort} HTTP 健康（跳过试运行）` })
+          resolvePromise({ ok: true, output: `现有实例 @ :${targetPort} HTTP 健康（跳过试运行）`, shortcut: true })
           return
         }
         log(`[预检] 现有实例 @ :${targetPort} 不在线/不健康 → 走完整试运行`)
@@ -554,6 +573,27 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   const checks: Record<string, { ok: boolean; detail: string }> = {}
   const fail = (key: string, detail: string) => { checks[key] = { ok: false, detail } }
   const pass = (key: string, detail: string) => { checks[key] = { ok: true, detail } }
+
+  // ---- 自证轨迹（S4 证据层）：一行一阶段，落 `<DSH_HOME>/preflight-trace.jsonl` ----
+  // 观测绝不反噬：preflightTrace 一律吞错返回 bool，预检结论不受影响（技能 C4）。
+  const startedAt = Date.now()
+  const builds = collectBuilds({ selfName: 'dsh-agent-preflight', selfFile: OWN_FILE, bin: cfg.bin })
+  const caller = captureCaller(new Error().stack)
+  const trace = (entry: Omit<PreflightTraceEntry, 'atMs' | 'pid' | 'mode' | 'build' | 'builds' | 'caller'>): boolean =>
+    preflightTrace({ mode, build: OWN_BUILD, builds, caller, ...entry })
+  const finish = (result: PreflightResult): PreflightResult => {
+    const failedChecks = Object.entries(result.checks).filter(([, c]) => !c.ok).map(([key]) => key)
+    const firstDetail = result.checks[failedChecks[0] ?? '']?.detail ?? ''
+    trace({
+      phase: 'verdict',
+      durationMs: Date.now() - startedAt,
+      verdict: result.pass ? 'PASS' : 'FAIL',
+      ...(failedChecks.length > 0 ? { failedChecks } : {}),
+      ...(firstDetail !== '' ? { error: firstDetail.slice(0, 300) } : {}),
+    })
+    return result
+  }
+  trace({ phase: 'start', durationMs: 0 })
 
   // ① 插件静态健康
   const issues = pluginStaticCheck(cfg)
@@ -596,12 +636,21 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   if (hardFail) {
     const output = '[预检] FAIL:\n' + Object.entries(checks)
       .filter(([, c]) => !c.ok).map(([k, c]) => `  - ${k}: ${c.detail}`).join('\n')
-    return { pass: false, checks, output }
+    return finish({ pass: false, checks, output })
   }
 
   // ⑥ 试运行（仅 full 模式）
   if (mode === 'full') {
+    trace({ phase: 'trialRun/begin', durationMs: Date.now() - startedAt })
+    const trialStartedAt = Date.now()
     const tr = await trialRun(cfg)
+    trace({
+      phase: 'trialRun/end',
+      durationMs: Date.now() - trialStartedAt,
+      shortcut: tr.shortcut,
+      // 断点分类（Q3）：类别 + 首行结论（机制结论在输出开头，见下方 slice(-300) 修复）
+      ...(tr.ok ? {} : { error: classifyTrialFailure(tr.output) + ': ' + (tr.output.split('\n')[0] ?? '').slice(0, 200) }),
+    })
     if (!tr.ok) {
       // 诊断盲区修复（2026-09-11 亲历）：原先 slice(-300) 只保留**尾部**日志，
       // 而失败原因（'HTTP 探活超时…' / '组合无法加载（试运行退出 code=N）'）在输出**开头**
@@ -616,5 +665,5 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   const output = '[预检] ' + (mode === 'full' ? 'full' : 'quick') + ' ' +
     (Object.values(checks).every((c) => c.ok) ? 'PASS' : 'FAIL') + '\n' +
     Object.entries(checks).map(([k, c]) => `  ${c.ok ? '✅' : '❌'} ${k}: ${c.detail}`).join('\n')
-  return { pass: Object.values(checks).every((c) => c.ok), checks, output }
+  return finish({ pass: Object.values(checks).every((c) => c.ok), checks, output })
 }
