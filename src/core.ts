@@ -123,6 +123,57 @@ function pluginStaticCheck(cfg: PreflightCoreConfig): string[] {
   return issues
 }
 
+/** ⑥ 配置文件可解析性（2026-09-17 扩范围 · BOM 事故驱动）。
+ *
+ * 事故：某个 package.json 被写入 **UTF-8 BOM** ⇒ 加载器 JSON.parse 失败 ⇒ web 崩溃、靠守护自愈拉起；
+ * 而**预检没有报**——因为 `pluginStaticCheck` 只看 lib 是否存在与 mtime，**从不解析 package.json**。
+ * 「文件能被加载器读懂」是重启的前置条件，却没进过检查清单。
+ *
+ * 判据纪律（客观、无启发式——误报会让 pluginStatic FAIL 造成 fail-closed 卡死部署，见本文件 §M4 注）：
+ *   · JSON 类：不得以 BOM 开头；且必须能被 `JSON.parse` 严格解析（顺带抓尾逗号/注释等非法 JSON）。
+ *   · YAML 类：不得以 BOM 开头（各解析器对 BOM 行为不一，BOM 是客观异态）。
+ * 覆盖：self-plugins/&lt;name&gt;/package.json · profile 的 package.json 与 cordis.patch.yml · $DSH_HOME/cordis.patch.yml。
+ */
+function hasBom(p: string): boolean {
+  try {
+    const b = readFileSync(p)
+    return b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf
+  } catch { return false }
+}
+
+export function configParseCheck(cfg: PreflightCoreConfig): string[] {
+  const issues: string[] = []
+  const checkJson = (p: string, label: string): void => {
+    if (!existsSync(p)) return
+    if (hasBom(p)) { issues.push(`${label} 含 UTF-8 BOM（${p}）——加载器 JSON.parse 会失败，必须先剥离`); return }
+    try {
+      JSON.parse(readFileSync(p, 'utf8'))
+    } catch (e) {
+      issues.push(`${label} 不是合法 JSON（${p}）: ${String((e as Error).message ?? e).slice(0, 100)}`)
+    }
+  }
+  const checkYaml = (p: string, label: string): void => {
+    if (!existsSync(p)) return
+    if (hasBom(p)) issues.push(`${label} 含 UTF-8 BOM（${p}）——YAML 解析器行为不一，先剥离`)
+  }
+
+  // 自研插件的 package.json（此前**从未被解析过**——这正是盲区所在）
+  const dir = join(cfg.workspace, 'self-plugins')
+  try {
+    for (const name of readdirSync(dir)) {
+      const pkg = join(dir, name, 'package.json')
+      if (existsSync(pkg)) checkJson(pkg, `self-plugins/${name}/package.json`)
+    }
+  } catch { /* self-plugins 不存在时由 pluginStaticCheck 报 */ }
+
+  // profile 清单与 patch（重启直接读它们）
+  const profileDir = join(cfg.dshHome, 'profiles', cfg.profile)
+  checkJson(join(profileDir, 'package.json'), `profile(${cfg.profile})/package.json`)
+  checkYaml(join(profileDir, 'cordis.patch.yml'), `profile(${cfg.profile})/cordis.patch.yml`)
+  checkYaml(join(cfg.dshHome, 'cordis.patch.yml'), 'cordis.patch.yml（DSH_HOME 根）')
+  return issues
+}
+
 /** ② 磁盘空间。 */
 function diskCheck(cfg: PreflightCoreConfig): { ok: boolean; message: string } {
   try {
@@ -614,6 +665,11 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   const patchIssues = patchCheck(cfg)
   if (patchIssues.length > 0) fail('patch', patchIssues.join('; '))
   else pass('patch', 'patch 文件 OK')
+
+  // ④b 配置文件可解析性（BOM / 非法 JSON —— 2026-09-17 扩范围）
+  const configIssues = configParseCheck(cfg)
+  if (configIssues.length > 0) fail('configParse', configIssues.join('; '))
+  else pass('configParse', '配置文件可解析（无 BOM / JSON 合法）')
 
   // ⑤ 会话日志完整性
   const logIssue = sessionLogCheck(cfg)
