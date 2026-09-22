@@ -3,6 +3,7 @@
 > 版本 v0.1 · 2026-09-13 · 作者：爱丽丝 · 状态：已实现（线上运行中：watch profile 提供服务，web 侧同源直调）
 > 开发方式：语义文档优先（先写清「是什么 / 什么关系 / 怎么裁决」，再让实现逼近，最后用实践回修）
 > 实现落点：`self-plugins/dsh-agent-preflight/src/core.ts`（检查核心）· `src/index.ts`（服务壳）· `src/trace.ts`（自证轨迹 · 2026-09-14）；消费方闸门副本 `self-plugins/dsh-agent-plugin-manager/src/preflight-gate.ts`
+> **复核记录（2026-09-22）**：`semantic_check` D3（实现比文档新）复核为**真过时**——impl 提交 `0693e60`（v0.1.3）新增的 ④b `configParse` 未进文档 ⇒ 已回写 §4 / §5.3 / §7 / §8 / §9 / §10（明细见 §9「2026-09-22 复核回写」）。
 
 ## 1 · 元信息
 
@@ -72,7 +73,7 @@ plugin-manager            sentinel                  guardian
           ctx.preflight.run(workspace, mode) ──► runPreflightCore(core.ts)
                  │                                    │
                  │                          ① pluginStatic ② disk ③ profile
-                 │                          ④ patch ⑤ sessionLog ⑤b peerDeps ⑤c env
+                 │                          ④ patch ④b configParse ⑤ sessionLog ⑤b peerDeps ⑤c env
                  │                                    │  任一项 FAIL → 立即返回 FAIL
                  │                          ⑥ trialRun（仅 full）：spawn + GET / + grace
                  ▼
@@ -134,6 +135,7 @@ interface PreflightResult {
 | ② | `disk` | DSH_HOME 可用空间 ≥ **200MB**（`statfsSync`） | fail | ✅ | ✅ |
 | ③ | `profile` | `profiles/<p>/package.json`：是 JSON 对象、`dsh.profile.bundles` 必须是数组、可解析（含 `workspace/.dsh/profiles/…` 兜底路径） | fail | ✅ | ✅ |
 | ④ | `patch` | `cordis.patch.yml`（DSH_HOME 与 profile 两处）：**不得为空/仅注释**（harness 解析为 nothing 会抛错），顶层须为列表 | fail | ✅ | ✅ |
+| ④b | `configParse` | **配置文件可解析性**（v0.1.3 · 2026-09-17 BOM 事故扩范围）：**JSON 类**（`self-plugins/<name>/package.json` · profile 的 `package.json`）不得以 UTF-8 BOM 开头，且必须能被 `JSON.parse` 严格解析（顺带抓尾逗号/注释等非法 JSON）；**YAML 类**（profile 的 `cordis.patch.yml` · `$DSH_HOME/cordis.patch.yml`）不得以 BOM 开头。判据只取客观异态（BOM / 解析失败），**无启发式**——误报会 fail-closed 卡死部署 | fail | ✅ | ✅ |
 | ⑤ | `sessionLog` | 最近 3 个会话日志（zstd 多帧手工扫描，最多 50 帧/2MB）：**不得含未知事件类型** `agent-teams/*`（harness 拒读 → 重启卡死） | fail | ✅ | ✅ |
 | ⑤b | `peerDeps` | profile 的 `link:`/`@deepseek-ai/*` 依赖：核心依赖缺失 = **fail**；`link:` 目标缺失 = **warning 不阻断**（残留条目容错） | fail / warn | ✅ | ✅ |
 | ⑤c | `env` | `workspace/.env` 存在但为空 → 提示配置可能缺失 | fail | ✅ | ✅ |
@@ -265,31 +267,33 @@ interface PreflightResult {
 
 | # | 可证伪命题 | 证据 | 状态 |
 |---|-----------|------|------|
-| A1 | 预检结果被哨兵按轮次真实落盘（PASS/FAIL 各成行） | `.dsh/.watch-events.log`：`预检 PASS` **340** 行 / `预检 FAIL` **22** 行；最近 FAIL = `2026-09-06T11:34:07Z` | ✅ 已实测 |
+| A1 | 预检结果被哨兵按轮次真实落盘（PASS/FAIL 各成行） | `.dsh/.watch-events.log`：`预检 PASS` **478** 行 / `预检 FAIL` **23** 行（**2026-09-22 复核刷新**，原读数 340/22）；最近 FAIL = `2026-09-22T04:15:58Z` | ✅ 已实测 |
 | A2 | FAIL 时**不 kill 旧 web**（免疫层） | 源码判据：`sentinel/src/index.ts` `runCycle` 在 `!pf.pass` 分支 `writeIncident` 后 `return`（kill 在其后）；现场记录：2026-09-12 BOM 包预检 FAIL 未重启（修正后重跑 PASS，见 `.plugin-manager-events.log` 部署说明） | ✔ 已实测 |
 | A3 | 门控四项判据 + 边界（`atMs === webStartMs` 放行） | `plugin-manager/test/preflight-gate.test.mjs`：全套 **26/26** 通过（含 14 条闸门用例：无记录/早于启动/边界闭区间/workspace 不符/pass≠true/怪物记录） | ✔ 已实测 |
 | A4 | 文案说「本 web 进程」而非「本会话」 | 同上测试套件含专项用例「无记录 → 拒绝，且文案说的是『本 web 进程』而非『本会话』」；`decidePreflightGate` 文案逐条核验 | ✔ 已实测 |
 | A5 | 记录含**真实调用者**，且 `sessionId ≠ 调用者`（遗留字段） | 线上 `.dsh/.preflight-invoked.json` 实测：`sessionId=session-89516696-bebe-…` 而 `caller.sessionId=session-879c4ae1-…`、`isMain=false`、`cwd=E:\alice` | ✅ 已实测 |
 | A6 | HTTP 探活口径接受 401（认证网关活着） | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/` → **401**（与 `probeHealth` 接受集合 `{2xx,401,403}` 一致） | ✔ 已实测 |
 | A7 | 诊断裁剪保留**头部原因**（修 09-11 盲区） | `dsh-agent-preflight/tests/clip.test.mjs`：**4/4** 通过（含尸体测试：证明旧 `slice(-300)` 确实丢掉 `HTTP 探活超时…`） | ✔ 已实测 |
-| A8 | `daemon_restart` 每次裁决写「门控证据」行到 `.plugin-manager-events.log` | 该行由 `44144be` 引入，需下一次 `daemon_restart` 才落盘；当前 `.plugin-manager-events.log` 中「门控证据」计数 = **0** | 待线上验收 |
-| A9 | quick 模式不做试运行（时延显著低于 full） | 线上记录可证 `mode` 字段被写入（实测值 `"quick"`），但**尚无同一口径的耗时对照** | 待线上验收 |
+| A8 | `daemon_restart` 每次裁决写「门控证据」行到 `.plugin-manager-events.log` | **2026-09-22 复核（线上现算）**：计数 = **121** 行（`grep -c '门控证据' .dsh/.plugin-manager-events.log`）；末行 = `2026-09-22T04:29:30.624Z daemon_restart 门控证据：预检记录来自 session-005ddf46-… · 调用者比对：同一会话 · 结论=放行`（含调用者比对结论）。原判据要求「下一次 `daemon_restart` 后统计」——现已有 121 次真实裁决在案 | ✔ 已实测 |
+| A9 | quick 模式不做试运行（时延显著低于 full） | **2026-09-22 复核（线上现算）**：`.dsh/preflight-trace.jsonl` 900 行按 `(pid, start→verdict)` 配对读 `durationMs`——**quick** n=67：min 13 / 中位 **99ms** / p90 187 / max 6424；**full·真试运行**（`trialRun/end.shortcut=false`）n=78：min 11683 / 中位 **22792ms** / p90 88748 / max 115996；full·现有实例短路（`shortcut=true`）n=111：中位 154ms（**与真试运行区分开**——这正是 S4 加 `shortcut` 字段的用途）。阶段枚举亦自证：quick 无 `trialRun/*` 行。同口径中位差 ≈ **230×** | ✔ 已实测 |
 | A10 | 组合变更时短路失效（`hasUnverifiedBuilds` ⇒ 强制完整试运行） | 逻辑位于 `plugin-manager/src/index.ts:62/567`；**无单测、未在受控条件下实测** | 待线上验收 |
 | A11 | 会话日志完整性检查能拦未知事件类型 `agent-teams/*` | 该检查是 2026-08-26 事故的防线；当前**无测试夹具**、线上也未再触发 | 待线上验收 |
 | A12 | 哨兵侧闸门判据 = **组合变更新鲜度**（旧 30 分钟窗口会放行的形状必须被拒） | `dsh-agent-sentinel/tests/preflight-gate.test.mjs`：**23/23** 通过，含 2 条**回归尸体样本**（① 预检发生在上一 web 进程 + 其后有新构建 → 必须拒绝，旧实现会放行；② 预检晚于构建但早于本轮 web 启动 → 拒绝）+ 边界（同毫秒放行）+ 异常四类（缺失/损坏/非数字/workspace 不符/未通过）；哨兵全仓 **56/56** 零回归 | ✔ 已实测（离线） |
-| A13 | 哨兵侧新判据**线上生效**（`.watch-events.log` 出现 `预检闸门裁决:` 行且含三个时间源） | 代码/测试/构建完成于 2026-09-13，但 watch profile 重启归主人（§5.2）——部署窗口前线上仍跑旧判据（§5.11 §6 重建≠生效） | 待线上验收 |
-| A14 | 每次预检**自己落盘**阶段行：真实调用路径（不是只有纯函数）产出 `start → … → verdict`，quick 无 `trialRun/*`，full 有 `trialRun/begin`/`trialRun/end` | `tests/wiring.test.mjs` 2 条**接线证据**（搭临时组合喂 `DSH_HOME`，断言 `<DSH_HOME>/preflight-trace.jsonl` 阶段序列 + `build` 形状 + `caller` 命中测试文件帧 + `no-bin` 断点分类）：`npm test` **24/24** 通过 | ✔ 已实测（离线接线） |
+| A13 | 哨兵侧新判据**线上生效**（`.watch-events.log` 出现 `预检闸门裁决:` 行且含三个时间源） | **2026-09-22 复核（线上现算）**：`grep -c '预检闸门裁决' .dsh/.watch-events.log` = **107** 行，且每行都含三个时间源。末行 = `2026-09-22T04:29:31.142Z 预检闸门裁决: 放行 · 判据时间源：最新构建=2026-09-22T04:29:05.134Z · 本轮web启动=2026-09-22T04:19:14.562Z · 预检记录=2026-09-22T04:29:24.199Z · web 启动时刻来源: 本轮 web 启动时刻（本哨兵进程内 spawn 记录）`。**拒绝面也有活证据**：`04:17:52.522Z` 以「组合已变更：最新构建晚于预检」拒绝（这正是新判据独有的形状，旧 30 分钟窗口会放行） | ✔ 已实测 |
+| A14 | 每次预检**自己落盘**阶段行：真实调用路径（不是只有纯函数）产出 `start → … → verdict`，quick 无 `trialRun/*`，full 有 `trialRun/begin`/`trialRun/end` | `tests/wiring.test.mjs` 2 条**接线证据**（搭临时组合喂 `DSH_HOME`，断言 `<DSH_HOME>/preflight-trace.jsonl` 阶段序列 + `build` 形状 + `caller` 命中测试文件帧 + `no-bin` 断点分类）：`npm test` **31/31** 通过（2026-09-22 复核刷新：含 `config-parse` 7 条）。**线上现算**：`<DSH_HOME>/preflight-trace.jsonl` **900 行**（首 `2026-09-14T11:12:46`→末 `2026-09-22T12:29:31`），阶段分布 `start 260 / verdict 260 / trialRun·begin 190 / trialRun·end 190`，`verdict` = PASS 254 / FAIL 6（`failedChecks` = `pluginStatic`×5 + `trialRun`×1） | ✔ 已实测（离线接线 + 线上） |
 | A15 | 轨迹写失败**不反噬**：不可写路径 → 返回 `false` 且不抛，预检结论不变 | `tests/trace.test.mjs` 尸体测试（父路径是普通文件 → `false` 且 `doesNotThrow`）+ 坏行/半行/空行/`null` 容错解析 + 缺失文件返回 `[]`；`preflightTrace` 不可写路径返回 `false` | ✔ 已实测 |
+| A16 | 新增检查项 `configParse` 判据客观且**零误报**：JSON 类不得带 BOM 且须能 `JSON.parse`；YAML 类不得带 BOM；干净树必须 0 条 | `tests/config-parse.test.mjs` **7/7**（含**尸体测试**：干净树 0 条、缺文件不报、只查目标 profile——误报会 fail-closed 卡死部署）。**2026-09-22 复核现算**（独立于插件、直读文件字节）：`self-plugins/*/package.json` 带 BOM **0 个** / 非法 JSON **0 个**、`profiles/web/package.json` 与 `profiles/web/cordis.patch.yml` 无 BOM、`profiles/headless/cordis.patch.yml` **仍带 BOM**（= 已知坏样本仍在场，判据有**阳性对照**）。交付记录另载双环境读数 `profile=web → 0 条` / `profile=headless → 1 条`（提交 `0693e60`） | ✔ 已实测 |
+| A17 | 线上运行的预检构建**含 `configParse`**（构建自证，不是版本号自述） | **2026-09-22 复核现算**：`preflight-trace.jsonl` 的 `build` = `<版本>@<core 模块 mtime>`——`0.1.3@1789642170126`（288 行，= configParse 提交 `0693e60` 的 `src/core.ts` mtime）+ `0.1.3@1789876244152`（106 行，= 2026-09-20 11:50 重建的 `lib/core.js`）；`builds[]` 亦报 `dsh-agent-preflight 0.1.3`。**范围标注（重要）**：`verdict` 行只记 `failedChecks`（现算 6 次 FAIL 中无 `configParse`），**无 PASS 逐项明细** ⇒ 「`configParse` 本次确实跑过并通过」**不可直接观察**；本行只证「线上跑的是含它的构建」 | ✔ 已实测（构建自证） |
 
-> 计数：total 15 · 已实测 10（A1–A7、A12、A14、A15）· 待线上验收 5（A8–A11、A13）。
+> 计数（**2026-09-22 复核刷新**）：total 17 · 已实测 15（A1–A9、A12–A17）· 仅剩 2 条未验证（A10 `hasUnverifiedBuilds` 短路、A11 会话日志检查——两者均缺夹具或受控实测）。
 > 说明：本表状态词遵循机器约定（`✔/✅/已实测` = 有证据；`待线上验收` = 未验证）。
-> `tail -n 4 <DSH_HOME>/preflight-trace.jsonl` 是 A14 的**线上复核命令**（部署窗口后执行；当前该文件尚未生成）。
+> `tail -n 4 <DSH_HOME>/preflight-trace.jsonl` 是 A14 的**线上复核命令**——**已执行**（2026-09-22 复核：文件 900 行，见 A14 证据）。
 
 ---
 
 ## 8 · 与实现的关系
 
-- **主实现**：`self-plugins/dsh-agent-preflight/src/core.ts`（`runPreflightCore` + 8 个检查器 + `probeHealth` / `runTrialSpawn` / `clipHeadTail`）+ `src/trace.ts`（自证轨迹：纯函数 + 薄 IO，`core.ts` 只做接线）。
+- **主实现**：`self-plugins/dsh-agent-preflight/src/core.ts`（`runPreflightCore` + **9 个检查器**（v0.1.3 起含 `configParse`）+ `probeHealth` / `runTrialSpawn` / `clipHeadTail`）+ `src/trace.ts`（自证轨迹：纯函数 + 薄 IO，`core.ts` 只做接线）。
 - **服务壳**：`src/index.ts`（读 Config → 组装 `PreflightCoreConfig` → `ctx.provide('preflight', { run })`）。
 - **同语义副本（消费方，互相指认）**：
   - `plugin-manager/src/preflight-gate.ts` —— **闸门裁决**的纯逻辑（数据结构、裁决表、调用者提取）；其文件头明确指认本能力为判据来源（§5.5）。
@@ -297,7 +301,7 @@ interface PreflightResult {
   - `sentinel/src/preflight-gate.ts` —— 本能力**第二道闸门**的纯逻辑（2026-09-13 起与 `plugin-manager/src/preflight-gate.ts` **同判据**：组合变更新鲜度；差异只在 `webStartMs` 的获取方式——独立进程只能自记）；IO 接线在 `sentinel/src/index.ts`。
 - **未实现 / 未验证部分（显式标注）**：
   - **无 `/health` 路由**：2026-08-31 主人定调「不改原版 DSH」，探活改用 `GET /`（见 §9）。
-  - 本插件**自身**测试：`tests/clip.test.mjs`（4）、`tests/trial-deadline.test.mjs`（6）、`tests/trace.test.mjs`（12）、`tests/wiring.test.mjs`（2）= **24 条**；8 个检查器与完整试运行（spawn 真实子进程）**仍无离线单测**（试运行路径的接线由 `wiring.test.mjs` 覆盖到 `bin` 不可得分支，真 spawn 分支的证据仍来自线上事件日志与消费方测试）。
+  - 本插件**自身**测试：`tests/clip.test.mjs`（4）、`tests/trial-deadline.test.mjs`（6）、`tests/trace.test.mjs`（12）、`tests/wiring.test.mjs`（2）、`tests/config-parse.test.mjs`（7）= **31 条**（2026-09-22 复核刷新，原记 24 条）；**9 个检查器**与完整试运行（spawn 真实子进程）**仍无离线单测**（试运行路径的接线由 `wiring.test.mjs` 覆盖到 `bin` 不可得分支，真 spawn 分支的证据仍来自线上事件日志与消费方测试）——`configParse` 是目前**唯一带专项测试文件**的检查器（其余检查器的证据仍在线上日志里）。
   - 未接入 CI；未做「探活时序」的单元级模拟（grace 窗口为时间相关的集成行为）。
 
 ---
@@ -345,12 +349,22 @@ interface PreflightResult {
   - 语义**被补充**：`trialRun` 返回值新增 `shortcut: boolean`（短路 PASS vs 真 spawn）——否则「毫秒级 PASS」与「试运行通过」在证据层无法区分（**Q4 结果质量**）。
   - 语义**被确认**：轨迹**只追加、不参与裁决**——`.preflight-invoked.json` 仍是门控唯一真源（§2 反定位已显式区分「运行证据」与「门控记录」）。
   - 教训（回写技能 `plugin-maintainability`）：**计算引擎型插件同样要自证**——「标记由消费方写」不等于「本插件有证据层」；失败现场的产出方才是最该说话的那个。
+- **2026-09-17 上游 BOM 事故 → 检查面扩范围（v0.1.3；提交 `0693e60`；本条为 2026-09-22 复核回写补记）**
+  - 事故：某个 `package.json` 被写入 **UTF-8 BOM** ⇒ 加载器 `JSON.parse` 失败 ⇒ web 崩溃、靠守护自愈拉起（`[守护] web 已拉起（保活/自愈）`），而**预检没有报**。盲区成因：`pluginStaticCheck` 只看 `lib/index.js` 是否存在与 mtime——**从不解析 `package.json`**。「文件能被加载器读懂」是重启的前置条件，却从未进过检查清单。
+  - 语义**被补充**：新增检查项 **④b `configParse`**（§5.3）——JSON 类不得带 BOM 且须能被 `JSON.parse` 严格解析；YAML 类不得带 BOM。执行位置在 `patch` 之后、`sessionLog` 之前（落在**快速失败链**内）。
+  - 语义**被确认（判据纪律）**：只取**客观异态**（BOM / 解析失败），不做启发式。这不是与 2026-08-31「删掉高误报启发式」冲突——那条删的是**扫 lib 产物找 schema 违规**（低价值、高误报），本条查的是**语法层客观事实**（BOM 是客观异态、`JSON.parse` 失败是客观事实）。
+  - 教训：**「文件能被加载器读懂」是独立的一类前置条件**——检查项按「哪一步会失败」分，不按「哪个文件属于哪个插件」分。
+- **2026-09-22 复核回写（`semantic_check` D3 告警驱动）**
+  - 触发：D3 报「实现比文档新」（impl `src/core.ts` mtime 2026-09-17 > doc 2026-09-14）。复核结论 = **真过时**：`0693e60` 新增的 ④b `configParse` 在文档里**完全没有痕迹**（§4 流程图 / §5.3 清单 / §8 检查器计数 / 验收表皆无）。
+  - 本次修正：① §4 流程图补 ④b；② §5.3 补 `configParse` 行（判据 + 执行位置）；③ §8 刷新「9 个检查器 / 31 条测试」；④ **验收表按线上现算刷新**——A1 计数刷新（478 PASS / 23 FAIL）、A8/A9/A13 由未验证转**已实测**（门控证据 **121** 行 / quick 中位 **99ms** vs 真试运行中位 **22792ms** / 闸门裁决 **107** 行且含三时间源）、A14 补线上读数（trace **900** 行）、新增 **A16**（`configParse` 判据 + 干净树 0 条 + `headless` 真实 BOM 阳性对照）与 **A17**（构建自证：线上跑的是含它的构建）；⑤ §10 **U1 结案**（哨兵侧判据已上线）。
+  - **诚实边界**：A17 只证「线上运行的构建含 `configParse`」——`verdict` 行只记 `failedChecks`，**PASS 逐项明细不可观察**，故未声称「线上确实跑过它并通过」。A10/A11 仍缺夹具与受控实测，**保持未验证**（不用「线上大概覆盖过」笼统掩盖）。
+  - 教训：**否定性状态（「当前计数 = 0」「尚无耗时可对照」「该文件尚未生成」）是最容易过期的一类断言**——它们把「当时的观测缺口」写成了永久结论。复核时优先重读这些句子，并把判据换成**可随时重算的现算读数**（本条的 121 行 / 99ms vs 22792ms / 107 行 / 900 行都是这样得到的）。
 
 ---
 
 ## 10 · 未决问题
 
-- **U1 哨兵侧新判据待上线（2026-09-13 `t-49913844`：代码/测试/构建已完成，等 watch 部署窗口）**：旧 U1（文案残留）与旧 U2（哨兵 30 分钟窗口与 plugin-manager 进程级判据并存）已从**代码层**解决（见 §5.5 判据表、§9 修订记录），但**线上哨兵仍跑旧判据**——改动受 §5.2 约束（watch profile 重启归主人），部署窗口到来前 §5.11 §6「重建 ≠ 生效」适用。上线验收：`.watch-events.log` 出现 `预检闸门裁决:` 行，且含「最新构建 / 本轮web启动 / 预检记录」三个时间源。
+- ~~**U1 哨兵侧新判据待上线**~~ **【2026-09-22 复核结案】**：上线验收判据已满足——`.watch-events.log` 现算 **107** 行 `预检闸门裁决:`，每行都含「最新构建 / 本轮web启动 / 预检记录」三个时间源（末行 `2026-09-22T04:29:31.142Z` 放行；另 `04:17:52.522Z` 以「组合已变更：最新构建晚于预检」拒绝 = 新判据独有形状）。旧 U1（文案残留）与旧 U2（30 分钟窗口与进程级判据并存）由代码层 + 上线共同解决（见 §5.5 判据表、§9 修订记录）。
 - **U3 会话日志检查无测试**：`sessionLogCheck` 是 2026-08-26 事故的防线，却没有任何夹具（未知事件样本）。倾向：用真实损坏样本做尸体测试（构造含 `"type":"agent-teams/` 的最小 zstd 多帧文件）。
 - **U4 `probeExistingFirst` 短路边界**：判定依据是 `lib/index.js` mtime；若新构建的 mtime 早于本进程启动（例如构建后回滚文件时间），短路会误判「已验证」。倾向：改判据为「launch 后是否有新构建**出现过**」（落盘标记），而非纯 mtime 比较。
 - **U5 检查项与 harness 启动检查的对齐维护**：本能力自称「对齐 `dsh-app-boot` 的 assertEntriesLoaded/Activated」，但 harness 升级后对齐关系无机器校验。倾向：把 harness 侧的启动检查清单固化成一份对照表并纳入 D3 类 drift（文档 vs 实现）。
