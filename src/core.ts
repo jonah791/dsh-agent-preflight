@@ -714,7 +714,14 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
       // 改为「头 400 + 尾 700」：机制结论在前，原始日志在后。
       fail('trialRun', '组合无法加载或 web 未响应：' + clipHeadTail(tr.output, 400, 700))
     } else {
-      pass('trialRun', '组合试运行 + / HTTP 2xx/401/403（web 侧真实可用）')
+      // ⚠ 短路必须**自称短路**（2026-10-11 事故）：probeExistingFirst=true 时若现有实例健康，
+      // 这一步**根本没有 spawn 组合**。原措辞一律写「组合试运行 + …」，于是它可以与「插件被宿主
+      // 静默 disable」同时为真——当日实测就是这样：预检报 full PASS，而 dsh-llm-probe 因 peer 范围
+      // 与运行时 0.2.1-alpha.2 不兼容被兼容门 disable，直到手动跑一次真试运行才看到错误文本。
+      // 一份「它没有做过的检查」的合格证，比没有检查更坏。
+      pass('trialRun', tr.shortcut
+        ? '短路：**未做真实试运行**（' + tr.output + '）——它不构成「新组合可加载」的证据；验新组合须 probeExistingFirst=false 强制完整 spawn'
+        : '组合试运行 + / HTTP 2xx/401/403（web 侧真实可用）')
     }
   }
 
