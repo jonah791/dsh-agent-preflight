@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-preflight"><img src="https://img.shields.io/badge/version-0.1.2-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-24%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-31%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：重启前的**保险丝**——在任何「把当前实例换成新实例」的不可逆动作之前，先真的加载一次新组合，加载不起来就拦住（fail-closed）。
