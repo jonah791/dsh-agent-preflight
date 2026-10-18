@@ -3,7 +3,7 @@
   "manifestVersion": "0.1.0",
   "id": "com.jonah791.agent-preflight",
   "name": "dsh-agent-preflight",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "apiVersion": ">=0.1.0 <0.2.0",
   "entrypoints": {
     "host": "lib/fabric.js"

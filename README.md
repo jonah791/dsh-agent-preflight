@@ -38,7 +38,7 @@
 | `dsh-agent-guardian` | 崩溃自愈拉起前，`quick` 模式秒级放行 |
 | `dsh-agent-plugin-manager` | `preflight_check` 工具 → 同一核心；挂载/启停/改配置后强制完整试运行 |
 
-检查项（`checks` 的 8 个键）：
+检查项（`checks` 的 9 个键）：
 
 | 键 | 检查什么 |
 |----|---------|
@@ -46,12 +46,16 @@
 | `disk` | 磁盘剩余空间 |
 | `profile` | profile manifest：JSON 对象 / bundles 列表 / 每个包必须有 bundle 声明 |
 | `patch` | `cordis.patch.yml` 校验（空文件 / 注释-only 会抛错） |
+| `configParse` | 配置文件可解析性：JSON 类不能带 BOM 且必须能 `JSON.parse`；YAML 类不能带 BOM（2026-09-17 BOM 事故扩范围） |
 | `sessionLog` | 会话日志完整性——未知事件类型会让重启卡死（2026-08-26 事故） |
 | `peerDeps` | peer 依赖完整性（cordis / schemastery / dsh-tools 等缺失） |
 | `env` | 环境变量（`loadLayeredEnv` 语义：bootstrap-only 文件变量拒绝） |
 | `trialRun` | **真试运行**：spawn 一个完整 web（同 profile/凭据/DSH_HOME），对齐 harness 启动的 `assertEntriesLoaded` / `assertEntriesActivated` |
+| `presets` | **预设能不能激活**（v0.1.4 · 2026-10-19 `agent-preset/invalid` 事故扩面）：试运行实例里的探针问一次 `agentPresets.list()`，把每条 `broken` 上报成一行 `[preflight-preset-probe] {json}`；本项解析并裁决——**真 spawn 过就必须有上报**（fail-closed），短路/quick 用在飞诊断或如实报「未探测」 |
 
 > `full` 模式默认 `probeExistingFirst: true`：先探活现有实例端口，**HTTP 2xx/401/403 = 当前组合可加载的活证据** → 直接 PASS（毫秒级，不 spawn 重复实例）。仅当现有实例不健康时才走完整试运行。组合变更场景（挂载/启停/改配置后）应传 `false` 强制完整试运行。
+> ⚠ **短路只证明「在这个端口上活着的那份组合可用」**，不证明磁盘上的组合可用：`plugin-manager` 在「有未验证的新构建（self-plugins 的 `lib` 或 **profile 的 patch / package.json** 比本进程新）」时会强制 `probeExistingFirst=false`。
+> ⚠ `presets` 的三态（互不掩盖）：真 spawn 却没上报 ⇒ **FAIL**；没 spawn 也没在飞诊断 ⇒ PASS + **自报未探测**（它不构成证据）；该组合无预设注册表 ⇒ PASS + 自报无预设可检。
 
 ## 快速开始
 
@@ -106,6 +110,9 @@ tail -2 "$DSH_HOME/preflight-trace.jsonl"     # 期望：出现 verdict 行，ve
 | `defaultWorkspace` | `''`（回退进程 cwd） | `run(workspace)` 未传时的兜底工作区 |
 | `targetPort` | `3080` | 目标 web 端口：`probeExistingFirst` 探活它 |
 | `probeExistingFirst` | `true` | `full` 模式是否先探活现有实例短路（真试运行 = 慢路径）。组合变更场景传 `false` |
+| `presetProbeWaitMs` | `20000` | HTTP 就绪 + grace 之后，**再等预设探针上报**的额外窗口（先到先算）。探针要等 loader 结算后读注册表，通常比 HTTP 就绪晚；不给这个窗口，「未上报」会由我们自己的 kill 造成（假红） |
+| `livePresetProbe` | `undefined` | 短路/quick 模式下的**在飞组合**预设诊断供给（web 内 plugin-manager 传 `() => collectPresetReport(ctx)`）；缺省 ⇒ 未探测（如实披露，不冒充验证） |
+| `trialArgs` | `[]` | 试运行额外 **launcher** 级参数（如 `--patch <overlay>`）。⚠ 位置在 app 参数**之前**：`dsh --profile <p> [launcher options] --port <n> --no-open`；排在 `--port` 之后会被 web app 读成未知选项并立即退出（2026-10-19 实测踩过） |
 
 ## 落盘与自证（出问题时先看这里）
 
@@ -160,7 +167,7 @@ tail -3 "$DSH_HOME/preflight-trace.jsonl"
 npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 npm run build）
 ```
 
-**24 例离线测试全部通过**（`# pass 24 / # fail 0`）：
+**45 例离线测试全部通过**（`# pass 45 / # fail 0`）+ **2 例端到端**（默认 SKIP，`PREFLIGHT_E2E=1` 才跑）：
 
 | 文件 | 覆盖 |
 |------|------|
@@ -168,8 +175,10 @@ npm test        # = node --test "tests/*.test.mjs"（跑 lib/ 产物，需先 np
 | `tests/trace.test.mjs` | 轨迹层：`resolveHome`（`DSH_HOME` 优先 / 空白与缺失回退）、路径锚定、序列化单行且键序固定、解析容错（坏行/半行/空行/null 全跳过不抛）、追加不覆盖、**尸体测试**（父路径是普通文件 → 返回 `false` 且不抛）、`captureCaller`（跳过本插件帧；全自有帧 → `unknown`）、`collectBuilds`（版本读不到 → `unknown@mtime`） |
 | `tests/trial-deadline.test.mjs` | 试运行截止裁决 `decideTrialDeadline`：**尸体样本取自事故现场**（90s 到期但 6.9s 前仍有输出 → 延长而非判死）、真静默 → 判死并点名「卡死非慢启动」、硬上限优先于推进、三处边界（静默 == 推进窗口、`elapsed == 硬上限`、延长链不越过硬上限） |
 | `tests/wiring.test.mjs` | 端到端接线：`quick` 模式真实落盘 `start → verdict`（**无 trialRun 阶段**）；`full` 模式静态项全过 → 出现 `trialRun/begin` 与 `trialRun/end`（含断点分类） |
+| `tests/preset-probe.test.mjs` | 预设探针判据（2026-10-19 新增，14 例）：解析（噪日志中取行 / 坏行跳过 / 多行取最后 / 结构不合法不算上报 / 脏条目丢弃）· 三态裁决（真 spawn 未上报 ⇒ **FAIL**；未探测 ⇒ PASS+自报；无预设服务 ⇒ PASS+自报）· **尸体样本**：`agent-preset/invalid` 事故逐字文案必须判红且带 id 与原因原文 |
+| `tests/e2e-preset-probe.test.mjs` | **端到端标定**（默认 SKIP，`PREFLIGHT_E2E=1`）：真实 web profile 上跑两次 `runPreflightCore`——绿例（不加 overlay ⇒ 全预设可激活）与**尸体例**（`tests/fixtures/corpse-broken-preset.overlay.yml` 经 `--patch` 注入「同 scope 重名注册」的预设 ⇒ `presets` 必须红，其余 9 项全 ok） |
 
-**无网络依赖、无真实外部服务依赖**：测试链路由注入式配置 + 临时目录驱动，不 spawn 真 web（真试运行在生产路径上由消费方触发）。
+**离线用例**无网络依赖、无真实外部服务依赖：测试链路由注入式配置 + 临时目录驱动，不 spawn 真 web。**端到端用例**（`e2e-preset-probe.test.mjs`，默认 SKIP）例外——它刻意 spawn 真 web（真实组合的标定，证据只能从那里来），并按平台在 Windows 侧运行（`bin.js` 的绝对路径 + `node`）。
 
 ## 设计要点
 

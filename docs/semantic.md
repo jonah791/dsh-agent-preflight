@@ -11,8 +11,8 @@
 |------|-----|
 | 能力名 | 预检门控（preflight-gate） |
 | 主副本 | 本文件（`self-plugins/dsh-agent-preflight/docs/semantic.md`） |
-| 版本 / 日期 | v0.1 · 2026-09-13 · 作者：爱丽丝 |
-| 状态 | 已实现（线上运行中：watch profile 提供 `ctx.preflight` 服务；web profile 的 plugin-manager 直调同一份核心）｜验收 15 条：**10 已实测 / 5 待线上验收** |
+| 版本 / 日期 | v0.1.4 · 2026-10-19（新增 ⑦ `presets` 预设诊断；原 v0.1 · 2026-09-13）· 作者：爱丽丝 |
+| 状态 | 已实现（线上运行中：watch profile 提供 `ctx.preflight` 服务；web profile 的 plugin-manager 直调同一份核心）｜验收 20 条：**17 已实测 / 3 待**（A10、A11、A20 线上复跑） |
 | 实现落点 | `self-plugins/dsh-agent-preflight/src/core.ts`（检查核心，D1 唯一化）· `src/index.ts`（服务壳）· `src/trace.ts`（自证轨迹：纯函数 + 薄 IO） |
 | 消费方语义副本 | `self-plugins/dsh-agent-plugin-manager/src/preflight-gate.ts`（闸门纯逻辑，**判据来源指向本文件**） |
 | 挂载 | `profiles/watch/cordis.patch.yml:31`（`dsh-agent-preflight` 行） |
@@ -76,6 +76,8 @@ plugin-manager            sentinel                  guardian
                  │                          ④ patch ④b configParse ⑤ sessionLog ⑤b peerDeps ⑤c env
                  │                                    │  任一项 FAIL → 立即返回 FAIL
                  │                          ⑥ trialRun（仅 full）：spawn + GET / + grace
+                  │                          ⑦ presets：读试运行实例上报的预设诊断（真 spawn ⇒ 必须有；
+                  │                             短路/quick ⇒ 在飞诊断或披露「未探测」）
                  ▼
         pass=false ──► 调用方拒绝动作：不 kill（哨兵保留）/ 不拉起 / 不写哨兵 /
                         组合变更回滚；写 incident + 通知
@@ -91,6 +93,7 @@ plugin-manager            sentinel                  guardian
 5. **I5 记录写入不得被无关故障阻断**：会话 id 解析失败等**不得**导致记录未落盘（否则门控误判「没调用过」）；写失败要响亮（warn/错误行），不静默。
 6. **I6 记录读取失败不得伪装成「没调用过」**：读盘/解析异常以显式 issue/拒绝呈现，文案与真实原因一致。
 7. **I7 文案与判据同名**：判据是进程级时，文案必须说「本 web 进程」——不得说「本会话」（这是已修正的语义漂移，见 §9）。
+8. **I8 未探测 ≠ 通过**（v0.1.4 · 2026-10-19）：检查项只有**真的做过**才允许报绿；「没探」（短路 / 无诊断供给 / 探针未上报）必须在 detail 里**自称未探测**并声明它不构成证据。真 spawn 过试运行却没拿到探针上报 ⇒ 直接 FAIL（fail-closed）——否则就是「一份它没做过的检查的合格证」，比没有检查更坏。
 
 ---
 
@@ -126,6 +129,9 @@ interface PreflightResult {
 | `defaultWorkspace` | `''`（回退 `process.cwd()`） | workspace 兜底 |
 | `targetPort` | `3080` | 现有实例端口（短路探活用） |
 | `probeExistingFirst` | `true` | full 模式是否先探活现有实例短路 |
+| `presetProbeWaitMs` | `20000` | HTTP 就绪 + grace 之后，再等预设探针上报的额外窗口（先到先算）。探针要等 loader 结算后读注册表，通常比 HTTP 就绪晚——不给这个窗口，「未上报」会由我们自己的 kill 造成（假红） |
+| `livePresetProbe` | `undefined` | 短路/quick 模式下的**在飞组合**预设诊断供给（web 内 plugin-manager 传 `() => collectPresetReport(ctx)`）；缺省 ⇒ 未探测（如实披露，不冒充验证） |
+| `trialArgs` | `[]` | 试运行额外 **launcher** 级参数。⚠ 位置在 app 参数**之前**：`dsh --profile <p> [launcher options] --port <n> --no-open`；排在 `--port` 之后会被 web app 读成未知选项并立即退出（2026-10-19 实测踩过） |
 
 ### 5.3 检查项清单（`runPreflightCore` 按此顺序执行）
 
@@ -140,8 +146,12 @@ interface PreflightResult {
 | ⑤b | `peerDeps` | profile 的 `link:`/`@deepseek-ai/*` 依赖：核心依赖缺失 = **fail**；`link:` 目标缺失 = **warning 不阻断**（残留条目容错） | fail / warn | ✅ | ✅ |
 | ⑤c | `env` | `workspace/.env` 存在但为空 → 提示配置可能缺失 | fail | ✅ | ✅ |
 | ⑥ | `trialRun` | spawn 试运行 + `GET /`（2xx/401/403）+ grace 窗口存活 | fail | ✅ | — |
+| ⑦ | `presets` | **预设能不能激活**（v0.1.4 · 2026-10-19 `agent-preset/invalid` 事故扩面）：试运行实例里由 `dsh-agent-plugin-manager` 的探针问一次 `agentPresets.list()`，把每条 `broken` 上报成一行 `[preflight-preset-probe] {json}`；本项解析该行并裁决。**真的 spawn 过试运行 ⇒ 必须有该上报**（fail-closed）；短路/quick ⇒ 用调用方注入的在飞组合诊断（`livePresetProbe`，来源标注「当前进程组合」），都没有则**如实报「未探测」**（PASS 但披露，并声明它不构成证据） | fail / 披露 | ✅ | ✅（无试运行时走 in-flight 或披露） |
 
 **快速失败**：①–⑤c 任一 FAIL → 直接返回 `pass=false`，不进入 ⑥（省一次 20s 级 spawn）。
+**⑦ 的三态语义（互不掩盖，是本项的全部要点）**：`required ∧ 无上报` ⇒ **FAIL**（一份它没做过的检查的合格证比没有检查更坏）；`无上报 ∧ 非 required` ⇒ PASS + 自报未探测；`supported=false`（该组合无预设注册表）⇒ PASS + 自报无预设可检。有 `broken` ⇒ FAIL，逐条列出预设 id 与注册表给的原因原文。
+
+**为什么必须问注册表**：预设激活失败**不影响 web 启动**——注册表把原因记在 `broken` 上、只打一行 warn，直到**新建会话**才抛 `agent-preset/invalid: …`。2026-10-19 实测：在预设里挂同名工具（同 scope 重名）后，试运行 HTTP 健康、旧预检全绿，而**任何新建会话都建不起来**。
 
 ### 5.4 记录文件 `.preflight-invoked.json`
 
@@ -284,8 +294,11 @@ interface PreflightResult {
 | A15 | 轨迹写失败**不反噬**：不可写路径 → 返回 `false` 且不抛，预检结论不变 | `tests/trace.test.mjs` 尸体测试（父路径是普通文件 → `false` 且 `doesNotThrow`）+ 坏行/半行/空行/`null` 容错解析 + 缺失文件返回 `[]`；`preflightTrace` 不可写路径返回 `false` | ✔ 已实测 |
 | A16 | 新增检查项 `configParse` 判据客观且**零误报**：JSON 类不得带 BOM 且须能 `JSON.parse`；YAML 类不得带 BOM；干净树必须 0 条 | `tests/config-parse.test.mjs` **7/7**（含**尸体测试**：干净树 0 条、缺文件不报、只查目标 profile——误报会 fail-closed 卡死部署）。**2026-09-22 复核现算**（独立于插件、直读文件字节）：`self-plugins/*/package.json` 带 BOM **0 个** / 非法 JSON **0 个**、`profiles/web/package.json` 与 `profiles/web/cordis.patch.yml` 无 BOM、`profiles/headless/cordis.patch.yml` **仍带 BOM**（= 已知坏样本仍在场，判据有**阳性对照**）。交付记录另载双环境读数 `profile=web → 0 条` / `profile=headless → 1 条`（提交 `0693e60`） | ✔ 已实测 |
 | A17 | 线上运行的预检构建**含 `configParse`**（构建自证，不是版本号自述） | **2026-09-22 复核现算**：`preflight-trace.jsonl` 的 `build` = `<版本>@<core 模块 mtime>`——`0.1.3@1789642170126`（288 行，= configParse 提交 `0693e60` 的 `src/core.ts` mtime）+ `0.1.3@1789876244152`（106 行，= 2026-09-20 11:50 重建的 `lib/core.js`）；`builds[]` 亦报 `dsh-agent-preflight 0.1.3`。**范围标注（重要）**：`verdict` 行只记 `failedChecks`（现算 6 次 FAIL 中无 `configParse`），**无 PASS 逐项明细** ⇒ 「`configParse` 本次确实跑过并通过」**不可直接观察**；本行只证「线上跑的是含它的构建」 | ✔ 已实测（构建自证） |
+| A18 | **预设探针在真实试运行里上报**（`presets` 绿）：真实 web 组合 spawn 出的实例，其 `agentPresets.list()` 结果能被父进程解析成判据 | `tests/e2e-preset-probe.test.mjs`（`PREFLIGHT_E2E=1`，2026-10-19 实跑）：绿例 **19.8s** 通过，`presets` = `试运行实例 N 个预设全部可激活（… alice-v4 …）`。**首次真实运行即抓出一处真缺陷**：`worker-base` 预设四行缺必填 config（`agent-instructions.maxBytes` / `tool-fs-search.sampleOverCapGlobResults` / `tool-todo.allowParallelInProgress` / `plan-mode.section`）⇒ 该预设整体 broken（任何用它的新建会话必报 `agent-preset/invalid`）。已修（值对齐本文件其他预设）并复跑绿例通过 | ✔ 已实测（端到端） |
+| A19 | **尸体样本：同 scope 重名注册的预设必须被拦**，且红里带预设 id 与注册表原因原文；同一跑 `trialRun` 仍绿（证明这是**新增**检出力，不是重复报旧错） | `tests/e2e-preset-probe.test.mjs` 尸体例 + `_tmp_review/corpse-verdict.mjs` 逐字读数：overlay（`tests/fixtures/corpse-broken-preset.overlay.yml`）往组合里插一个两次注册 `skill` 的预设 ⇒ `verdict.pass=false`，`presets` = `试运行实例 有 1 个预设无法激活（新建会话会报 agent-preset/invalid）：· preflight-corpse: tool-skill-b (@deepseek-ai/dsh-tool-skill): tool "skill" is already registered in this scope`，而**其余 9 项全 ok（含 trialRun）**——旧检出力会把这个组合判 PASS | ✔ 已实测（端到端尸体） |
+| A20 | **组合面文件变更 ⇒ 短路失效**（只改 patch/preset 声明、不重建插件的那种形状也不许短路） | 纯函数 `compositionFilePaths`（含 `cordis.patch.yml`/profile `package.json`，**不含**启动时自写的 `cordis.yml`）+ `tests/ops-logic.test.mjs` 3 条（平台无关期望值 / 排除 `cordis.yml` 的理由 / 探针前缀单一真源 + 组合检测必须带 profile）；线上读数待本进程 `preflight_check` 复跑补录 | 待线上验收 |
 
-> 计数（**2026-09-22 复核刷新**）：total 17 · 已实测 15（A1–A9、A12–A17）· 仅剩 2 条未验证（A10 `hasUnverifiedBuilds` 短路、A11 会话日志检查——两者均缺夹具或受控实测）。
+> 计数（**2026-10-19 复核刷新**）：total 20 · 已实测 17（A1–A9、A12–A19）· 未验证 3：A10（`hasUnverifiedBuilds` 的 lib-mtime 短路——仍无单测；其**新扩面**已由 A20 覆盖）、A11（会话日志检查——缺夹具）、A20（组合面文件短路：纯函数与源码级契约已测，**线上复跑读数待补**）。
 > 说明：本表状态词遵循机器约定（`✔/✅/已实测` = 有证据；`待线上验收` = 未验证）。
 > `tail -n 4 <DSH_HOME>/preflight-trace.jsonl` 是 A14 的**线上复核命令**——**已执行**（2026-09-22 复核：文件 900 行，见 A14 证据）。
 
@@ -301,7 +314,7 @@ interface PreflightResult {
   - `sentinel/src/preflight-gate.ts` —— 本能力**第二道闸门**的纯逻辑（2026-09-13 起与 `plugin-manager/src/preflight-gate.ts` **同判据**：组合变更新鲜度；差异只在 `webStartMs` 的获取方式——独立进程只能自记）；IO 接线在 `sentinel/src/index.ts`。
 - **未实现 / 未验证部分（显式标注）**：
   - **无 `/health` 路由**：2026-08-31 主人定调「不改原版 DSH」，探活改用 `GET /`（见 §9）。
-  - 本插件**自身**测试：`tests/clip.test.mjs`（4）、`tests/trial-deadline.test.mjs`（6）、`tests/trace.test.mjs`（12）、`tests/wiring.test.mjs`（2）、`tests/config-parse.test.mjs`（7）= **31 条**（2026-09-22 复核刷新，原记 24 条）；**9 个检查器**与完整试运行（spawn 真实子进程）**仍无离线单测**（试运行路径的接线由 `wiring.test.mjs` 覆盖到 `bin` 不可得分支，真 spawn 分支的证据仍来自线上事件日志与消费方测试）——`configParse` 是目前**唯一带专项测试文件**的检查器（其余检查器的证据仍在线上日志里）。
+  - 本插件**自身**测试：`tests/clip.test.mjs`（4）、`tests/trial-deadline.test.mjs`（6）、`tests/trace.test.mjs`（12）、`tests/wiring.test.mjs`（2）、`tests/config-parse.test.mjs`（7）、`tests/preset-probe.test.mjs`（14，2026-10-19 新增）= **45 条**；另有 **2 条端到端**（`tests/e2e-preset-probe.test.mjs`：真实 web 组合 spawn + 绿/尸体两例，**默认 SKIP**，需 `PREFLIGHT_E2E=1` 才跑——它们会起完整 web 实例，约 20s/例）。**9 个检查器**与完整试运行（spawn 真实子进程）**仍无离线单测**（试运行路径的接线由 `wiring.test.mjs` 覆盖到 `bin` 不可得分支，真 spawn 分支的证据仍来自线上事件日志与消费方测试）——`configParse` 是目前**唯一带专项测试文件**的检查器（其余检查器的证据仍在线上日志里）。
   - 未接入 CI；未做「探活时序」的单元级模拟（grace 窗口为时间相关的集成行为）。
 
 ---
@@ -359,6 +372,14 @@ interface PreflightResult {
   - 本次修正：① §4 流程图补 ④b；② §5.3 补 `configParse` 行（判据 + 执行位置）；③ §8 刷新「9 个检查器 / 31 条测试」；④ **验收表按线上现算刷新**——A1 计数刷新（478 PASS / 23 FAIL）、A8/A9/A13 由未验证转**已实测**（门控证据 **121** 行 / quick 中位 **99ms** vs 真试运行中位 **22792ms** / 闸门裁决 **107** 行且含三时间源）、A14 补线上读数（trace **900** 行）、新增 **A16**（`configParse` 判据 + 干净树 0 条 + `headless` 真实 BOM 阳性对照）与 **A17**（构建自证：线上跑的是含它的构建）；⑤ §10 **U1 结案**（哨兵侧判据已上线）。
   - **诚实边界**：A17 只证「线上运行的构建含 `configParse`」——`verdict` 行只记 `failedChecks`，**PASS 逐项明细不可观察**，故未声称「线上确实跑过它并通过」。A10/A11 仍缺夹具与受控实测，**保持未验证**（不用「线上大概覆盖过」笼统掩盖）。
   - 教训：**否定性状态（「当前计数 = 0」「尚无耗时可对照」「该文件尚未生成」）是最容易过期的一类断言**——它们把「当时的观测缺口」写成了永久结论。复核时优先重读这些句子，并把判据换成**可随时重算的现算读数**（本条的 121 行 / 99ms vs 22792ms / 107 行 / 900 行都是这样得到的）。
+- **2026-10-18/19 `agent-preset/invalid` 事故 → 检查面到「预设能不能激活」（v0.1.4；主人「先增强一下预检能力」直接驱动）**
+  - 事故：把 `dsh-skill-router` 挂进预设（与同 scope 的官方 `tool-skill` 重名注册）后，**新建会话报** `agent-preset/invalid: … tool "skill" is already registered in this scope`；而当时预检读数全绿——`preflight-trace.jsonl` 里那几次 full 预检**全是 `shortcut:true`**（现有实例健康 ⇒ 没 spawn），即便真 spawn，旧检出力也只到「HTTP 是否响应」。**根因是检出力分层缺失**：预设激活失败**不影响 web 启动**（注册表记 `broken` + 一行 warn），只在建会话时抛。
+  - 语义**被补充**：新增检查项 **⑦ `presets`**（§5.3）——试运行实例里由 `dsh-agent-plugin-manager` 的探针问一次 `agentPresets.list()`，把每条 `broken` 上报成一行 `[preflight-preset-probe] {json}`；父进程解析并裁决。**真 spawn 过就必须有上报**（fail-closed）；短路/quick 用在飞诊断（`livePresetProbe`）或如实披露「未探测」。
+  - 语义**被补充（不变量 I8）**：「未探测 ≠ 通过」——没做过的事不许报绿，必须在 detail 里自称未探测。
+  - 语义**被补充（组合面扩面）**：`hasUnverifiedBuilds` 的候选加入 **profile 的 `cordis.patch.yml` / `package.json`**（mtime 晚于本进程启动 ⇒ 短路失效）。事故成因之一正是「只改 patch/preset 声明、不重建插件」⇒ 短路成立 ⇒ 新 preset 行从未被试运行验证过。⚠ 刻意**不含** `cordis.yml`（启动过程自写，实测写入 01:02:32 晚于进程启动 01:02:19 ⇒ 纳入即恒假阳性）。
+  - 语义**被补充（参数顺序即语义）**：`trialArgs`（launcher 级选项，如 `--patch <overlay>`）必须排在 **app 参数之前**——排在 `--port` 之后会被 web app 读成 `error: unknown option '--patch'`，app 立刻退出而宿主树没装完（实测症状：探针拿到 `supported:false`）。
+  - **首次真实运行就抓出一个真缺陷**（判据有检出力的活证据）：`worker-base` 预设四行缺必填 config（`agent-instructions.maxBytes` / `tool-fs-search.sampleOverCapGlobResults` / `tool-todo.allowParallelInProgress` / `plan-mode.section`）⇒ 该预设**整体 broken**（任何用它的新建会话必报 `agent-preset/invalid`）。已修（取值对齐同文件其他预设）并复跑绿例通过。
+  - 教训（两条）：① **检出力是有层次的**（进程活着 ⊂ 服务可用 ⊂ 组合可加载 ⊂ **预设可激活** ⊂ 会话可建）——每上一层都要一条新判据，且**下一层永远测不到上一层**；② **短路绿必须自报短路**（否则「没做过」与「做过且通过」长得一样）——这条 2026-10-11 已写过，本次是它在**新检查项上的复用**（I8 把它升为不变量）。
 
 ---
 
@@ -366,7 +387,7 @@ interface PreflightResult {
 
 - ~~**U1 哨兵侧新判据待上线**~~ **【2026-09-22 复核结案】**：上线验收判据已满足——`.watch-events.log` 现算 **107** 行 `预检闸门裁决:`，每行都含「最新构建 / 本轮web启动 / 预检记录」三个时间源（末行 `2026-09-22T04:29:31.142Z` 放行；另 `04:17:52.522Z` 以「组合已变更：最新构建晚于预检」拒绝 = 新判据独有形状）。旧 U1（文案残留）与旧 U2（30 分钟窗口与进程级判据并存）由代码层 + 上线共同解决（见 §5.5 判据表、§9 修订记录）。
 - **U3 会话日志检查无测试**：`sessionLogCheck` 是 2026-08-26 事故的防线，却没有任何夹具（未知事件样本）。倾向：用真实损坏样本做尸体测试（构造含 `"type":"agent-teams/` 的最小 zstd 多帧文件）。
-- **U4 `probeExistingFirst` 短路边界**：判定依据是 `lib/index.js` mtime；若新构建的 mtime 早于本进程启动（例如构建后回滚文件时间），短路会误判「已验证」。倾向：改判据为「launch 后是否有新构建**出现过**」（落盘标记），而非纯 mtime 比较。
+- **U4 `probeExistingFirst` 短路边界**：判定依据是 `lib/index.js` mtime；若新构建的 mtime 早于本进程启动（例如构建后回滚文件时间），短路会误判「已验证」。倾向：改判据为「launch 后是否有新构建**出现过**」（落盘标记），而非纯 mtime 比较。**【2026-10-19 部分收窄】**候选已扩到组合面文件（patch / `package.json`，见 §5.3 ⑦ 与验收 A20），覆盖了「只改声明不重建」这一形状；**mtime 回滚型误判仍在**（改完再改回旧时间戳），未做——它需要落盘标记而非 mtime 比较。
 - **U5 检查项与 harness 启动检查的对齐维护**：本能力自称「对齐 `dsh-app-boot` 的 assertEntriesLoaded/Activated」，但 harness 升级后对齐关系无机器校验。倾向：把 harness 侧的启动检查清单固化成一份对照表并纳入 D3 类 drift（文档 vs 实现）。
 - **U6 是否给 web 加 `/health`**：2026-08-31 主人定调「不改原版」（方案 A 只做过侦察）。现状 `GET /` 口径可用（实测 401）；若将来 web 端有了稳定健康端点，应优先改用它并回写本文 §5.3 ⑥ 与 §9。
 - **U7 `preflight-trace.jsonl` 无裁剪上限**：与 `plugin-boot.jsonl` 不同，本轨迹**没有** `keepLines` 轮转——写频率低（每次预检 ≤4 行）但长期无界。倾向：等真实行数/体积可观测后再定阈值（先要证据，再加机制）；若加，应复用 bootreport 的「旁车 + rename 原子替换」写法。

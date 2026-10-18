@@ -1,0 +1,24 @@
+# 预检尸体样本（2026-10-19 · 「增强预检」的标定物，**只进试运行实例**）
+#
+# 形状等价于当晚真实事故：预设的**同一个 scope 里两次注册同名工具**
+# （真实那次是 dsh-skill-router 与官方 tool-skill 抢 "skill"）。
+#
+# 用法：`runPreflightCore({ ..., trialArgs: ['--patch', <本文件>] })` 时随试运行生效；
+# **绝不**写进主人的 live cordis.patch.yml。
+# 期望读数：预检的 `presets` 判据变红，红里带 `preflight-corpse` 与
+# `already registered in this scope` 原因原文。
+- insert:
+    - id: preset-preflight-corpse
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: preflight-corpse
+        name: '预检尸体样本（故意坏）'
+        description: '同 scope 重复注册 skill 工具：预检必须判红'
+        order: 999
+        plugins:
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill-a
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: tool-skill-b
+            name: '@deepseek-ai/dsh-tool-skill'

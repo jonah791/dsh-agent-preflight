@@ -76,6 +76,22 @@ export interface PreflightCoreConfig {
    *   现有实例健康 ≠ 新组合可加载，必须真实 spawn 验证，失败回滚）。
    */
   probeExistingFirst: boolean
+  /**
+   * 试运行内等待预设探针上报的额外窗口（ms，缺省 20000）：HTTP 就绪并过完存活确认窗口后，
+   * 再等这么久或直到探针行出现（先到先算）——dot 探针要在 loader 结算后读注册表，
+   * 比 HTTP 就绪晚，不能被存活窗口直接杀掉（否则「探针未上报」全是自己造成的）。
+   */
+  presetProbeWaitMs?: number
+  /**
+   * 在飞组合的预设诊断供给（短路/quick 模式下用）：`dsh-agent-plugin-manager` 在本进程内
+   * 直接问一次 `agentPresets.list()`。缺省 undefined ⇒ 未探测（如实披露，不假装通过）。
+   */
+  livePresetProbe?: () => Promise<PresetProbePayload>
+  /**
+   * 试运行额外 CLI 参数（诊断/overlay 用，缺省 []）——例如 `['--patch', '<overlay.yml>']`：
+   * 用一个临时 overlay 造出「预设里有重名注册」的尸体组合，验证预设探针真的会红。
+   */
+  trialArgs?: readonly string[]
   /** 日志回调（缺省静默）。 */
   log?: (msg: string) => void
 }
@@ -506,6 +522,111 @@ export function decideTrialDeadline(input: {
   }
 }
 
+/**
+ * 试运行实例上报的预设诊断载荷（2026-10-19 · 预检增强 · agent-preset/invalid 事故驱动）。
+ *
+ * 为什么需要它：`agent-preset` 的激活失败**不影响 web 启动**——注册表把原因记在 `broken` 上、
+ * 只打一行 warn，直到**新建会话**才以 `agent-preset/invalid: …` 抛出。2026-10-19 01:00 实测：
+ * 在 alice-v4 预设里挂 `dsh-skill-router`（与同 scope 的官方 `tool-skill` 重名注册）后，
+ * 试运行 HTTP 健康、预检全绿，而**任何新建会话都建不起来**（旧预检的检出力到不了这一层）。
+ * ⇒ 试运行必须顺带问一次预设注册表：能启动 ≠ 能建会话。
+ */
+export interface PresetProbePayload {
+  /** 所有预设都可激活 ⇒ true。 */
+  ok: boolean
+  /** false = 该进程没有 agentPresets 服务（本组合无预设可检）——不是失败。 */
+  supported: boolean
+  /** 每个预设：可激活则只有 id；不可激活带 broken（注册表给出的原因原文）。 */
+  presets: Array<{ id: string; broken?: string }>
+  /** 探针自身失败（枚举抛错等）。 */
+  error?: string
+  atMs?: number
+  pid?: number
+}
+
+/** 上报行前缀：child 打一行 `<前缀><JSON>`，parent 从试运行输出里解析。 */
+export const PRESET_PROBE_PREFIX = '[preflight-preset-probe] '
+
+/**
+ * 从试运行输出里取最后一条预设诊断。
+ *
+ * 宽容策略（与「坏记录 = 证据」纪律一致）：单行坏 JSON ⇒ 跳过继续找；整段没有 ⇒ null
+ * （由 {@link presetProbeVerdict} 按 required 决定「未上报」是 FAIL 还是「未探测」披露）。
+ */
+export function parsePresetProbe(output: string): PresetProbePayload | null {
+  let found: PresetProbePayload | null = null
+  for (const line of output.split('\n')) {
+    const at = line.indexOf(PRESET_PROBE_PREFIX)
+    if (at < 0) continue
+    const raw = line.slice(at + PRESET_PROBE_PREFIX.length).trim()
+    let parsed: unknown
+    try { parsed = JSON.parse(raw) } catch { continue }
+    if (typeof parsed !== 'object' || parsed === null) continue
+    const obj = parsed as Record<string, unknown>
+    if (typeof obj.ok !== 'boolean' || typeof obj.supported !== 'boolean') continue
+    const presets: Array<{ id: string; broken?: string }> = []
+    if (Array.isArray(obj.presets)) {
+      for (const row of obj.presets) {
+        if (typeof row !== 'object' || row === null) continue
+        const { id, broken } = row as { id?: unknown; broken?: unknown }
+        if (typeof id !== 'string' || id === '') continue
+        presets.push(typeof broken === 'string' && broken !== '' ? { id, broken } : { id })
+      }
+    }
+    found = {
+      ok: obj.ok,
+      supported: obj.supported,
+      presets,
+      ...(typeof obj.error === 'string' && obj.error !== '' ? { error: obj.error } : {}),
+      ...(typeof obj.atMs === 'number' ? { atMs: obj.atMs } : {}),
+      ...(typeof obj.pid === 'number' ? { pid: obj.pid } : {}),
+    }
+  }
+  return found
+}
+
+/**
+ * 预设诊断 → 检查结论（纯函数，可离线单测）。
+ *
+ * 三态语义（互不掩盖）：
+ *   · `required && payload === null` ⇒ **FAIL**：本次真的 spawn 了试运行，探针却没有上报
+ *     ⇒ 这是「一份它没做过的检查的合格证」的形状，不能放过（fail-closed）。
+ *   · `!required && payload === null` ⇒ PASS 但**自报未探测**（短路/quick 没 spawn，也没有在飞诊断供给）。
+ *   · `supported === false` ⇒ PASS 但**自报无预设可检**（该组合没有预设注册表）。
+ * 有 broken（或 ok=false）⇒ FAIL，逐条列出预设 id 与注册表给的原因原文。
+ */
+export function presetProbeVerdict(input: {
+  payload: PresetProbePayload | null
+  required: boolean
+  source: 'trial' | 'live'
+}): { ok: boolean; detail: string } {
+  const where = input.source === 'trial' ? '试运行实例' : '当前进程组合'
+  const payload = input.payload
+  if (payload === null) {
+    if (input.required) {
+      return { ok: false, detail: '试运行实例未上报预设诊断（探针未运行）——预设激活失败只在建会话时暴露，'
+        + '没有这份诊断就不能声称「预设可用」（可能原因：dsh-agent-plugin-manager 未构建/未挂载在该 profile）' }
+    }
+    return { ok: true, detail: '未探测预设（未做真实试运行，且无在飞组合诊断供给）——它不构成「预设可用」的证据' }
+  }
+  if (payload.error !== undefined) return { ok: false, detail: '预设探针失败（' + where + '）：' + payload.error }
+  if (!payload.supported) return { ok: true, detail: '未探测预设（' + where + ' 无 agentPresets 服务 ⇒ 本组合无预设可检）' }
+  const broken = payload.presets.filter(row => row.broken !== undefined)
+  if (broken.length > 0) {
+    return {
+      ok: false,
+      detail: where + ' 有 ' + String(broken.length) + ' 个预设无法激活（新建会话会报 agent-preset/invalid）：'
+        + broken.map(row => '\n    · ' + row.id + ': ' + String(row.broken)).join(''),
+    }
+  }
+  if (!payload.ok) return { ok: false, detail: where + ' 预设探针报 ok=false 但未给出 broken 明细（证据自相矛盾，按失败处理）' }
+  return {
+    ok: true,
+    detail: where + ' ' + String(payload.presets.length) + ' 个预设全部可激活'
+      + (payload.presets.length > 0 ? '（' + payload.presets.map(row => row.id).join(' / ') + '）' : ''),
+  }
+}
+
 /** 完整试运行：spawn 组合 + HTTP 探活 + 存活确认窗口（含 2026-09-01 spawn error 监听修复）。 */
 function runTrialSpawn(
   cfg: PreflightCoreConfig,
@@ -522,7 +643,11 @@ function runTrialSpawn(
   }
   findFreePort().then((port) => {
     if (port === 0) { settle(false, '[预检] 无法分配空闲端口'); return }
-    const args = ['--expose-internals', cfg.bin, '--profile', cfg.profile, '--port', String(port), '--no-open']
+    // ⚠ 参数顺序即语义（2026-10-19 实测踩过）：`dsh [--profile] <name> [launcher options] [app-args...]`
+    // —— `--port`/`--no-open` 之后的一切都归**被启动的 app**。`trialArgs` 是 launcher 级选项
+    // （如 `--patch <overlay>`），必须排在 app 参数**之前**；排在后面会被 web app 读成
+    // `error: unknown option '--patch'` ⇒ app 立刻退出、宿主树没装完 ⇒ 探针拿到 supported:false。
+    const args = ['--expose-internals', cfg.bin, '--profile', cfg.profile, ...(cfg.trialArgs ?? []), '--port', String(port), '--no-open']
     const child = spawn(process.execPath, args, {
       cwd: cfg.workspace,
       // 试运行实例是**完整 web**（同 profile/凭据/DSH_HOME）：打标记让副作用型插件让位，
@@ -546,9 +671,12 @@ function runTrialSpawn(
 
     const progressWindowMs = Number(cfg.trialProgressWindowMs ?? 15000)
     const hardMaxMs = Number(cfg.trialHardMaxMs ?? 240000)
+    /** HTTP 就绪后不再按「静默」判死：组合已经加载成功，剩下的只是等预设探针上报。 */
+    let httpReady = false
     let deadline: ReturnType<typeof setTimeout>
     const arm = (delayMs: number): void => {
       deadline = setTimeout(() => {
+        if (httpReady) { arm(progressWindowMs); return }
         const verdict = decideTrialDeadline({
           startedAt,
           now: Date.now(),
@@ -579,11 +707,23 @@ function runTrialSpawn(
     })
     void probeHealth(port, cfg.preflightReadyMs + hardMaxMs).then((ok) => {
       if (!ok) return // 由 deadline 收尾
+      httpReady = true
       const grace = Number(cfg.preflightGraceMs || 10000)
       setTimeout(() => {
         clearTimeout(deadline)
-        child.kill()
-        settle(true, out)
+        // 存活窗口过后再给预设探针一点时间（先到先算）：探针要等 loader 结算后读注册表，
+        // 通常比 HTTP 就绪晚；等不到也不在这里判死——「未上报」由 presetProbeVerdict 定生死
+        // （required=true 时 FAIL），这样「没探」与「探了没问题」不会长得一样。
+        const probeDeadline = Date.now() + Number(cfg.presetProbeWaitMs ?? 20000)
+        const waitProbe = (): void => {
+          if (parsePresetProbe(out) !== null || Date.now() >= probeDeadline) {
+            child.kill()
+            settle(true, out)
+            return
+          }
+          setTimeout(waitProbe, 250)
+        }
+        waitProbe()
       }, grace)
     })
   })
@@ -696,10 +836,14 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   }
 
   // ⑥ 试运行（仅 full 模式）
+  let trialSpawned = false
+  let trialOutput = ''
   if (mode === 'full') {
     trace({ phase: 'trialRun/begin', durationMs: Date.now() - startedAt })
     const trialStartedAt = Date.now()
     const tr = await trialRun(cfg)
+    trialSpawned = !tr.shortcut
+    trialOutput = tr.output
     trace({
       phase: 'trialRun/end',
       durationMs: Date.now() - trialStartedAt,
@@ -723,6 +867,29 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
         ? '短路：**未做真实试运行**（' + tr.output + '）——它不构成「新组合可加载」的证据；验新组合须 probeExistingFirst=false 强制完整 spawn'
         : '组合试运行 + / HTTP 2xx/401/403（web 侧真实可用）')
     }
+  }
+
+  // ⑦ 预设诊断（2026-10-19 增强 · `agent-preset/invalid` 事故驱动）
+  // 事故形状：预设里的插件行**挂载失败不影响 web 启动**（注册表记 broken + 一行 warn），
+  // 直到新建会话才抛 `agent-preset/invalid: …` ⇒ 旧预检全绿而「任何新会话都建不起来」。
+  // 这里的判据：真的 spawn 过试运行 ⇒ 必须有它上报的预设诊断（fail-closed）；
+  // 短路/quick ⇒ 有在飞组合诊断就用（当前进程注册表），没有就如实报「未探测」。
+  {
+    let payload: PresetProbePayload | null = null
+    let source: 'trial' | 'live' = 'trial'
+    if (trialSpawned) {
+      payload = parsePresetProbe(trialOutput)
+    } else if (cfg.livePresetProbe !== undefined) {
+      source = 'live'
+      try {
+        payload = await cfg.livePresetProbe()
+      } catch (e) {
+        payload = { ok: false, supported: true, presets: [], error: String((e as Error).message ?? e) }
+      }
+    }
+    const verdict = presetProbeVerdict({ payload, required: trialSpawned, source })
+    if (verdict.ok) pass('presets', verdict.detail)
+    else fail('presets', verdict.detail)
   }
 
   const output = '[预检] ' + (mode === 'full' ? 'full' : 'quick') + ' ' +
