@@ -352,31 +352,81 @@ function envCheck(cfg: PreflightCoreConfig): string[] {
   return issues
 }
 
-/** ⑤ 会话日志完整性（未知事件类型 → harness 拒读 → 重启卡死；2026-08-26 事故防线）。 */
-function sessionLogCheck(cfg: PreflightCoreConfig): string | null {
+/**
+ * 会话目录的项目键——**线性拷贝**自宿主真源
+ * `deepseek-harness/packages/session/session-persistence-jsonl/src/format.ts:225-245`（`projectKey`）。
+ * 必须逐字对齐：分隔符**连续出现只出一个 `-`**，所以 `E:\alice` → `--E-alice--`，不是 `--E--alice--`。
+ * 2026-11-03 实测：本插件此前用三次 `replaceAll` 拼接，得到 `--E--alice--`——该目录不存在
+ * ⇒ 检查恒 `return null`。真源改口径时这里要跟着改，测试用两个**现读到的真实目录名**钉住。
+ * @param cwd - 会话的项目目录。
+ * @returns 宿主实际使用的项目目录名。
+ */
+function projectKeyOf(cwd: string): string {
+  let readable = ''
+  let separatorRun = false
+  for (let i = 0; i < cwd.length; i++) {
+    const code = cwd.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    if (ch === '/' || ch === '\\' || ch === ':') {
+      if (!separatorRun) readable += '-'
+      separatorRun = true
+    } else if (ch !== '~' && /^[A-Za-z0-9._-]$/.test(ch)) {
+      readable += ch
+      separatorRun = false
+    } else {
+      readable += '~' + code.toString(16).toUpperCase().padStart(4, '0')
+      separatorRun = false
+    }
+  }
+  const slug = readable.replace(/^-+/, '') || 'root'
+  return `--${slug.slice(0, 251)}--`
+}
+
+/**
+ * ⑤ 会话日志完整性（未知事件类型 → harness 拒读 → 重启卡死；2026-08-26 事故防线）。
+ *
+ * 2026-11-03 修两个盲区（此前两者叠加 ⇒ 本检查恒绿且什么都没看）：
+ * ① 文件名写死 `session.jsonl.zstd`，真源是 `session.v<版本>.jsonl.zstd`——实测该名 **0 个**、
+ *    `session.v*` **374 个**。⇒ 改为按 `session(.v<数字>)?` 匹配。
+ * ② 只解最前 50 帧。而未知事件是**追加**进来的 ⇒ 它只可能出现在**最新的帧**里，头部永远干净。
+ *    ⇒ 两头都扫（尾部优先），总解压量仍封顶 2 MB（本检查自己绝不能变成 OOM 源）。
+ * 只扫**最新 1 个**日志：要防的是「即将重启的这个会话」，而 readFileSync 一个 136 MB 的
+ * 日志即占 136 MB 缓冲（该检查跑在 web 进程内）——扫 3 个就是 3 倍，收益不抵风险。
+ * @param cfg - 预检配置（只用 dshHome 与 workspace）。
+ * @returns 问题描述；健康返回 null。
+ */
+export function sessionLogCheck(cfg: PreflightCoreConfig): string | null {
   try {
     const zlib = requireNode('node:zlib') as typeof import('node:zlib')
     const fs = requireNode('node:fs') as typeof import('node:fs')
     const sessionsDir = join(cfg.dshHome, 'sessions')
     if (!existsSync(sessionsDir)) return null
-    const wsEnc = '--' + cfg.workspace.replaceAll('\\', '-').replaceAll('/', '-').replaceAll(':', '-') + '--'
-    const wsDir = join(sessionsDir, wsEnc)
+    const wsDir = join(sessionsDir, projectKeyOf(cfg.workspace))
     if (!existsSync(wsDir)) return null
     const logs = readdirSync(wsDir)
-      .map((d) => join(wsDir, d, 'session.jsonl.zstd'))
+      .flatMap((d) => {
+        const dir = join(wsDir, d)
+        try {
+          return readdirSync(dir)
+            .filter((f) => /^session(\.v\d+)?\.jsonl\.zstd$/.test(f))
+            .map((f) => join(dir, f))
+        } catch { return [] }
+      })
       .filter((p) => existsSync(p))
       .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
-      .slice(0, 3)
+      .slice(0, 1)
     for (const logPath of logs) {
       const buf = fs.readFileSync(logPath)
       const frames = scanZstdFrames(buf)
-      let plain = ''
-      for (const { start, end } of frames.slice(0, 50)) {
-        try { plain += zlib.zstdDecompressSync(buf.subarray(start, end)).toString('utf8') } catch { /* 单帧失败跳过 */ }
-        if (plain.length > 2 * 1024 * 1024) break
-      }
-      if (/\"type\":\"agent-teams\//.test(plain)) {
-        return `会话日志 ${logPath} 含未知事件类型 agent-teams/*（harness 拒读 → 重启卡死）。请先修复会话日志`
+      for (const slice of [frames.slice(-200), frames.slice(0, 50)]) {
+        let plain = ''
+        for (const { start, end } of slice) {
+          try { plain += zlib.zstdDecompressSync(buf.subarray(start, end)).toString('utf8') } catch { /* 单帧失败跳过 */ }
+          if (plain.length > 2 * 1024 * 1024) break
+        }
+        if (/\"type\":\"agent-teams\//.test(plain)) {
+          return `会话日志 ${logPath} 含未知事件类型 agent-teams/*（harness 拒读 → 重启卡死）。请先修复会话日志`
+        }
       }
     }
     return null
@@ -650,6 +700,10 @@ function runTrialSpawn(
     const args = ['--expose-internals', cfg.bin, '--profile', cfg.profile, ...(cfg.trialArgs ?? []), '--port', String(port), '--no-open']
     const child = spawn(process.execPath, args, {
       cwd: cfg.workspace,
+      // ⚠ 必须隐藏窗口（2026-10-21 · 主人两次反馈「启动和重启时有个空窗口」）：
+      // 试运行是**完整 web 实例**，在 Windows 上 spawn 一个 console 子系统进程 ⇒ 弹黑框。
+      // 每次启动/重启预检都跑 ⇒ 每次都弹。这是 pure cosmetic 但每天干扰主人。
+      windowsHide: true,
       // 试运行实例是**完整 web**（同 profile/凭据/DSH_HOME）：打标记让副作用型插件让位，
       // 否则它会与 live 实例争抢外部资源（2026-09-13 实测：同一 Telegram bot 长轮询 409 冲突，
       // 且第二个实例的 getUpdates 可能吞掉主人的消息）。
