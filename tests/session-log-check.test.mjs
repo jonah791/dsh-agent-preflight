@@ -38,7 +38,7 @@ test('corpse: v4 log whose poisoned event sits past the first 50 frames is rejec
   const clean = Array.from({ length: 60 }, () => frame(CLEAN))
   const { root, cleanup } = withLog('aaaaaaaa-1111-2222-3333-444444444444', 'session.v4.jsonl.zstd', [...clean, frame(POISON)])
   try {
-    const issue = sessionLogCheck({ dshHome: root, workspace: WORKSPACE })
+    const issue = sessionLogCheck({ dshHome: root, workspace: WORKSPACE }).issue
     assert.ok(issue, 'append-only poison must be caught — head-only scanning misses it')
     assert.match(issue, /agent-teams/)
     assert.match(issue, /session\.v4\.jsonl\.zstd/)
@@ -49,28 +49,31 @@ test('corpse: poisoned event in the first frame of a v3 log is rejected', () => 
   const clean = Array.from({ length: 60 }, () => frame(CLEAN))
   const { root, cleanup } = withLog('bbbbbbbb-1111-2222-3333-444444444444', 'session.v3.jsonl.zstd', [frame(POISON), ...clean])
   try {
-    assert.match(sessionLogCheck({ dshHome: root, workspace: WORKSPACE }) ?? '', /agent-teams/)
+    assert.match(sessionLogCheck({ dshHome: root, workspace: WORKSPACE }).issue ?? '', /agent-teams/)
   } finally { cleanup() }
 })
 
-test('control: clean v4 log passes (a defense that always fails is not a defense)', () => {
+test('control: clean v4 log passes, and the pass line says what was actually read', () => {
   const clean = Array.from({ length: 65 }, () => frame(CLEAN))
   const { root, cleanup } = withLog('cccccccc-1111-2222-3333-444444444444', 'session.v4.jsonl.zstd', clean)
   try {
-    assert.equal(sessionLogCheck({ dshHome: root, workspace: WORKSPACE }), null)
+    const result = sessionLogCheck({ dshHome: root, workspace: WORKSPACE })
+    assert.equal(result.issue, null)
+    // 恒绿与「根本没检查」在读数上完全相同，detail 是唯一区别——所以要钉住它。
+    assert.match(result.detail, /已读最新 1 个日志/)
   } finally { cleanup() }
 })
 
 test('legacy unversioned file name still matched', () => {
   const { root, cleanup } = withLog('dddddddd-1111-2222-3333-444444444444', 'session.jsonl.zstd', [frame(POISON)])
   try {
-    assert.match(sessionLogCheck({ dshHome: root, workspace: WORKSPACE }) ?? '', /agent-teams/)
+    assert.match(sessionLogCheck({ dshHome: root, workspace: WORKSPACE }).issue ?? '', /agent-teams/)
   } finally { cleanup() }
 })
 
 test('missing sessions directory is not an error', () => {
   const root = mkdtempSync(join(tmpdir(), 'preflight-session-log-'))
   try {
-    assert.equal(sessionLogCheck({ dshHome: root, workspace: WORKSPACE }), null)
+    assert.equal(sessionLogCheck({ dshHome: root, workspace: WORKSPACE }).issue, null)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

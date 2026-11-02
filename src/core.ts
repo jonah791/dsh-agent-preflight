@@ -393,16 +393,19 @@ function projectKeyOf(cwd: string): string {
  * 只扫**最新 1 个**日志：要防的是「即将重启的这个会话」，而 readFileSync 一个 136 MB 的
  * 日志即占 136 MB 缓冲（该检查跑在 web 进程内）——扫 3 个就是 3 倍，收益不抵风险。
  * @param cfg - 预检配置（只用 dshHome 与 workspace）。
- * @returns 问题描述；健康返回 null。
+ * @returns `issue` = 问题描述（健康为 null）；`detail` = **本次到底看了什么**的取证行。
+ *   为什么要 detail：恒绿的检查与根本没装的检查在读数上完全相同——2026-11-03 查出的三重盲区
+ *   就是这样躺了两个月，每次预检都报「会话日志无未知事件」而实际一个字节都没读。
  */
-export function sessionLogCheck(cfg: PreflightCoreConfig): string | null {
+export function sessionLogCheck(cfg: PreflightCoreConfig): { issue: string | null; detail: string } {
+  const key = projectKeyOf(cfg.workspace)
   try {
     const zlib = requireNode('node:zlib') as typeof import('node:zlib')
     const fs = requireNode('node:fs') as typeof import('node:fs')
     const sessionsDir = join(cfg.dshHome, 'sessions')
-    if (!existsSync(sessionsDir)) return null
-    const wsDir = join(sessionsDir, projectKeyOf(cfg.workspace))
-    if (!existsSync(wsDir)) return null
+    if (!existsSync(sessionsDir)) return { issue: null, detail: '会话日志未检查（无 sessions 目录）' }
+    const wsDir = join(sessionsDir, key)
+    if (!existsSync(wsDir)) return { issue: null, detail: `会话日志未检查（无项目目录 ${key}）` }
     const logs = readdirSync(wsDir)
       .flatMap((d) => {
         const dir = join(wsDir, d)
@@ -415,6 +418,8 @@ export function sessionLogCheck(cfg: PreflightCoreConfig): string | null {
       .filter((p) => existsSync(p))
       .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
       .slice(0, 1)
+    if (logs.length === 0) return { issue: null, detail: '会话日志未检查（项目目录下没有 session*.jsonl.zstd）' }
+    let framesSeen = 0
     for (const logPath of logs) {
       const buf = fs.readFileSync(logPath)
       const frames = scanZstdFrames(buf)
@@ -424,13 +429,16 @@ export function sessionLogCheck(cfg: PreflightCoreConfig): string | null {
           try { plain += zlib.zstdDecompressSync(buf.subarray(start, end)).toString('utf8') } catch { /* 单帧失败跳过 */ }
           if (plain.length > 2 * 1024 * 1024) break
         }
+        framesSeen += slice.length
         if (/\"type\":\"agent-teams\//.test(plain)) {
-          return `会话日志 ${logPath} 含未知事件类型 agent-teams/*（harness 拒读 → 重启卡死）。请先修复会话日志`
+          return { issue: `会话日志 ${logPath} 含未知事件类型 agent-teams/*（harness 拒读 → 重启卡死）。请先修复会话日志`, detail: '' }
         }
       }
     }
-    return null
-  } catch { return null }
+    return { issue: null, detail: `会话日志无未知事件（已读最新 1 个日志 / ${String(framesSeen)} 帧）` }
+  } catch (error) {
+    return { issue: null, detail: '会话日志未检查（读取异常：' + (error instanceof Error ? error.message : String(error)) + '）' }
+  }
 }
 
 /** zstd 帧扫描（从 dsh-agent-watch 迁移，node:zlib 多帧支持有限）。 */
@@ -866,9 +874,9 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   else pass('configParse', '配置文件可解析（无 BOM / JSON 合法）')
 
   // ⑤ 会话日志完整性
-  const logIssue = sessionLogCheck(cfg)
-  if (logIssue) fail('sessionLog', logIssue)
-  else pass('sessionLog', '会话日志无未知事件')
+  const logResult = sessionLogCheck(cfg)
+  if (logResult.issue) fail('sessionLog', logResult.issue)
+  else pass('sessionLog', logResult.detail)
 
   // ⑤b peer 依赖完整性
   const depCheck = peerDepCheck(cfg)
