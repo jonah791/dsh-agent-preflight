@@ -954,6 +954,25 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
     else fail('presets', verdict.detail)
   }
 
+  // ⑧ 本进程内存（2026-11-03 · t-861961f0 的后续）
+  // 10-18 那次 OOM 的崩溃点就在「预检 PASS 后 0.7 秒、kill 之前」，而当时没有任何一条
+  // 读数记下「重启前的活堆是多少」——事后只能拿一句 `Mark-Compact 4093.2 -> 4092.1 MB`
+  // 反推。这里不改任何行为，只在每次预检留一条可对时的记忆：**重启前 web 自己有多满**。
+  // 只报读数与一个告警信号，不判定也不拦截：开不开重启是我的决定，不是这条的。
+  {
+    const mu = typeof process !== 'undefined' && typeof process.memoryUsage === 'function'
+      ? process.memoryUsage()
+      : null
+    if (mu === null) {
+      pass('memory', '本进程内存未探测（无 process.memoryUsage）')
+    } else {
+      const mb = (n: number): string => (n / 1048576).toFixed(0)
+      const nearCrash = mu.heapUsed / 1048576 >= 3072
+      pass('memory', `本进程 heapUsed ${mb(mu.heapUsed)} MB / heapTotal ${mb(mu.heapTotal)} MB / RSS ${mb(mu.rss)} MB`
+        + (nearCrash ? ' ⚠ 已到 10-18 崩溃时活堆（4,093 MB）的 3/4 以上' : ''))
+    }
+  }
+
   const output = '[预检] ' + (mode === 'full' ? 'full' : 'quick') + ' ' +
     (Object.values(checks).every((c) => c.ok) ? 'PASS' : 'FAIL') + '\n' +
     Object.entries(checks).map(([k, c]) => `  ${c.ok ? '✅' : '❌'} ${k}: ${c.detail}`).join('\n')
