@@ -100,11 +100,32 @@ const noopLog = (_msg: string): void => { /* 静默 */ }
 
 // ---------- 检查器 ----------
 
+/**
+ * 递归取目录下指定后缀文件的最新 mtime；目录不存在或无匹配返回 0。
+ * 吞错（权限/竞态一律跳过）——观测不反噬预检主流程。
+ */
+function newestMtime(dir: string, ext: string): number {
+  let newest = 0
+  const walk = (d: string): void => {
+    let entries: string[] = []
+    try { entries = readdirSync(d) } catch { return }
+    for (const name of entries) {
+      const p = join(d, name)
+      let st: ReturnType<typeof statSync>
+      try { st = statSync(p) } catch { continue }
+      if (st.isDirectory()) walk(p)
+      else if (name.endsWith(ext) && st.mtimeMs > newest) newest = st.mtimeMs
+    }
+  }
+  walk(dir)
+  return newest
+}
+
 /** ① 插件静态健康（lib 存在 / src 时效 / lib 可读——从 dsh-agent-watch 迁移）。
  *  2026-08-31 审计 M4：移除 schema 违规启发式正则扫描（scanRe）——它扫描 lib 产物极易误报，
  *  而误报会让 pluginStatic FAIL → preflight FAIL → 拒绝重启（fail-closed 卡死正常部署）。
  *  真正的 DSL 违规会在 tsc 构建期/harness 加载时报错，无需此低价值高风险启发式。 */
-function pluginStaticCheck(cfg: PreflightCoreConfig): string[] {
+export function pluginStaticCheck(cfg: Pick<PreflightCoreConfig, 'workspace'>): string[] {
   const issues: string[] = []
   const dir = join(cfg.workspace, 'self-plugins')
   let entries: string[] = []
@@ -121,17 +142,19 @@ function pluginStaticCheck(cfg: PreflightCoreConfig): string[] {
       issues.push(name + ': lib/index.js 缺失（未构建？重启后插件无法加载）')
       continue
     }
-    const libMtime = statSync(lib).mtimeMs
-    const srcDir = join(pkgDir, 'src')
-    try {
-      for (const f of readdirSync(srcDir)) {
-        if (!f.endsWith('.ts')) continue
-        if (statSync(join(srcDir, f)).mtimeMs > libMtime) {
-          issues.push(name + ': src/' + f + ' 比 lib 新（改了没构建——重启会加载旧代码）')
-          break
-        }
+    // 判据：src/**/*.ts 的最新 mtime vs **lib 全部产物**的最新 mtime。
+    // 2026-11-03 修两个盲区：① 原实现只扫 src 顶层 ⇒ 5 个插件（browser / plugin-manager /
+    //   taskboard / growth-profile / panel）的 src/client|types|panels 改动完全看不到；
+    //   ② 原实现只拿 lib/index.js 的 mtime 当基线 ⇒ lib 里其它产物旧了同样看不出。
+    const srcMtime = newestMtime(join(pkgDir, 'src'), '.ts')
+    if (srcMtime > 0) {
+      const libMtime = newestMtime(join(pkgDir, 'lib'), '.js')
+      // 60 秒容差：构建刚完成时的写盘抖动不该报
+      if (srcMtime > libMtime + 60_000) {
+        const days = Math.round((srcMtime - libMtime) / 86400000)
+        issues.push(name + ': src 比 lib 产物新 ' + days + ' 天（改了没构建——重启会加载旧代码）')
       }
-    } catch { /* src 不存在 = 纯 lib 插件 */ }
+    }
     try {
       readFileSync(lib, 'utf8')
     } catch { issues.push(name + ': lib/index.js 读取失败') }
