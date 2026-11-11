@@ -839,6 +839,31 @@ function trialRun(cfg: PreflightCoreConfig): Promise<{ ok: boolean; output: stri
 }
 
 /**
+ * 预检输出的显眼化（lh-daaaa35a 的 ③，2026-11-12）。
+ *
+ * 背景：`daemon_restart` 的门禁只判「本 web 进程内调用过 preflight_check」，**不看 pass/fail**
+ * ——所以 FAIL 的预检照样能重启。这个语义**暂不改**（改门控属动核心引擎，须主人拍板），
+ * 但至少不能让 FAIL 在输出里长得跟 PASS 差不多：失败项排最前，并明写「本次预检不拦截重启」。
+ *
+ * 反面教材（本条要治的形态）：`dsh-agent-emotion` 从 2026-09-23 起就该报 pluginStatic FAIL，
+ * 41 天里重启照常——不是没人看输出，是 FAIL 混在几十行 ✅ 里，读的人自然漏掉。
+ */
+export function formatChecks(pass_: boolean, checks: Record<string, { ok: boolean; detail: string }>): string {
+  const entries = Object.entries(checks)
+  const failed = entries.filter(([, c]) => !c.ok)
+  const oked = entries.filter(([, c]) => c.ok)
+  const lines = [...failed, ...oked].map(([k, c]) => `  ${c.ok ? '✅' : '❌'} ${k}: ${c.detail}`)
+  if (pass_ || failed.length === 0) return lines.join('\n')
+  return [
+    '════════ 预 检 未 通 过 ════════',
+    `❌ ${failed.length} 项失败，已排在最前：${failed.map(([k]) => k).join(' · ')}`,
+    '⚠ 本次预检 **不拦截** daemon_restart —— 门禁只判「有没有调过预检」，不判 pass/fail。',
+    '  要不要重启由你决定；上面这几项就是重启后可能踩的坑。',
+    ...lines,
+  ].join('\n')
+}
+
+/**
  * 主预检入口（共享核心）。mode=full 含试运行（主动重启/组合变更）；
  * mode=quick 仅静态+磁盘+会话日志（崩溃自愈，毫秒级）。fail-closed。
  * probeExistingFirst 只影响 full 模式：true=现有实例健康短路（当前组合检查），
@@ -915,9 +940,7 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
   // 快速失败：静态/磁盘/profile/patch/日志/依赖/env 任一 FAIL 即拒（不浪费试运行）
   const hardFail = Object.values(checks).some((c) => !c.ok)
   if (hardFail) {
-    const output = '[预检] FAIL:\n' + Object.entries(checks)
-      .filter(([, c]) => !c.ok).map(([k, c]) => `  - ${k}: ${c.detail}`).join('\n')
-    return finish({ pass: false, checks, output })
+    return finish({ pass: false, checks, output: formatChecks(false, checks) })
   }
 
   // ⑥ 试运行（仅 full 模式）
@@ -996,8 +1019,7 @@ export async function runPreflightCore(cfg: PreflightCoreConfig, mode: 'full' | 
     }
   }
 
-  const output = '[预检] ' + (mode === 'full' ? 'full' : 'quick') + ' ' +
-    (Object.values(checks).every((c) => c.ok) ? 'PASS' : 'FAIL') + '\n' +
-    Object.entries(checks).map(([k, c]) => `  ${c.ok ? '✅' : '❌'} ${k}: ${c.detail}`).join('\n')
-  return finish({ pass: Object.values(checks).every((c) => c.ok), checks, output })
+  const allPass = Object.values(checks).every((c) => c.ok)
+  const output = '[预检] ' + (mode === 'full' ? 'full' : 'quick') + ' ' + (allPass ? 'PASS' : 'FAIL') + '\n' + formatChecks(allPass, checks)
+  return finish({ pass: allPass, checks, output })
 }
