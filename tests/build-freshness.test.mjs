@@ -45,7 +45,14 @@ function setup(plugins) {
       utimesSync(p, t, t)
     }
   }
-  return { workspace: root, root, cleanup: () => rmSync(root, { recursive: true, force: true }) }
+  // dshHome 指向不存在的目录 ⇒ 部署形态检查（副本/软链）不适用，本文件只测构建时效
+  return {
+    workspace: root,
+    dshHome: join(root, 'dsh'),
+    profile: 'web',
+    root,
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  }
 }
 
 // ---------- 基本判据 ----------
@@ -145,7 +152,7 @@ test('60 秒容差：构造抖动不该报', () => {
 test('self-plugins 目录不存在 ⇒ 报目录不可读（不静默通过）', () => {
   const root = mkdtempSync(join(tmpdir(), 'pf-fresh-none-'))
   try {
-    const issues = pluginStaticCheck({ workspace: root })
+    const issues = pluginStaticCheck({ workspace: root, dshHome: join(root, 'dsh'), profile: 'web' })
     assert.equal(issues.length, 1)
     assert.match(issues[0], /self-plugins 目录不可读/)
   } finally { rmSync(root, { recursive: true, force: true }) }

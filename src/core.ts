@@ -14,7 +14,7 @@
  *
  * @module dsh-agent-preflight/core
  */
-import { existsSync, readFileSync, readdirSync, statSync, statfsSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync, statfsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { spawn } from 'node:child_process'
 import { createRequire } from 'node:module'
@@ -125,7 +125,7 @@ function newestMtime(dir: string, ext: string): number {
  *  2026-08-31 审计 M4：移除 schema 违规启发式正则扫描（scanRe）——它扫描 lib 产物极易误报，
  *  而误报会让 pluginStatic FAIL → preflight FAIL → 拒绝重启（fail-closed 卡死正常部署）。
  *  真正的 DSL 违规会在 tsc 构建期/harness 加载时报错，无需此低价值高风险启发式。 */
-export function pluginStaticCheck(cfg: Pick<PreflightCoreConfig, 'workspace'>): string[] {
+export function pluginStaticCheck(cfg: Pick<PreflightCoreConfig, 'workspace' | 'dshHome' | 'profile'>): string[] {
   const issues: string[] = []
   const dir = join(cfg.workspace, 'self-plugins')
   let entries: string[] = []
@@ -158,6 +158,27 @@ export function pluginStaticCheck(cfg: Pick<PreflightCoreConfig, 'workspace'>): 
     try {
       readFileSync(lib, 'utf8')
     } catch { issues.push(name + ': lib/index.js 读取失败') }
+  }
+  // 部署形态：自研插件被加载的必须是**软链回 self-plugins**，不能是副本。
+  // 事故（2026-11-12）：dsh-task-journal 只在 node_modules 里手工拷了一份、profile/package.json
+  //   从未声明它 ⇒ 此后每次重启加载的都是那份旧拷贝，构建再新也进不了进程；而上一条
+  //   「src 比 lib 新」的判据一直是绿的（lib 确实新）⇒ 排查方向整整偏了一轮。
+  // 判据：node_modules/<name> 存在，但 realpath 不等于 self-plugins/<name> ⇒ 加载的是副本。
+  //   不存在则跳过——插件可能由其它 resolver 提供，那不在本检查的判据范围内。
+  const nmDir = join(cfg.dshHome, 'profiles', cfg.profile, 'node_modules')
+  for (const name of entries) {
+    const target = join(nmDir, name)
+    if (!existsSync(target)) continue
+    let real: string
+    let expected: string
+    try {
+      real = realpathSync(target)
+      expected = realpathSync(join(dir, name))
+    } catch { continue }
+    if (real !== expected) {
+      issues.push(name + ': 部署的是副本（' + real + '）——改源码与构建都不生效；'
+        + '应在 profile/package.json 声明 "link:' + join(dir, name).replaceAll('\\', '/') + '" 并 pnpm install')
+    }
   }
   return issues
 }
